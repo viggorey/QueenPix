@@ -13,7 +13,7 @@ namespace QueenPix
         public string SelectedPath { get; private set; } = "";
         public string SelectedFilename { get; private set; } = "";
         public double SelectedFps { get; private set; } = 30.0;
-        public OutputFormat SelectedFormat { get; private set; } = OutputFormat.MP4;
+        public OutputFormat SelectedFormat { get; private set; } = OutputFormat.AVI;
         public Dictionary<string, (int startFrame, int endFrame)> FrameRanges { get; private set; }
         
         private List<(string filename, int frames, double duration)> frameStats;
@@ -165,8 +165,7 @@ namespace QueenPix
             {
                 Text = "MP4 (compressed)",
                 Location = new System.Drawing.Point(leftMargin + 185, y),
-                Size = new System.Drawing.Size(150, 20),
-                Checked = true
+                Size = new System.Drawing.Size(150, 20)
             };
             rbMP4.CheckedChanged += UpdateEstimatedSize;
             this.Controls.Add(rbMP4);
@@ -175,7 +174,8 @@ namespace QueenPix
             {
                 Text = "AVI (uncompressed)",
                 Location = new System.Drawing.Point(leftMargin + 345, y),
-                Size = new System.Drawing.Size(150, 20)
+                Size = new System.Drawing.Size(150, 20),
+                Checked = true          // default: the exact recorded frames (MP4 is lossy)
             };
             rbAVI.CheckedChanged += UpdateEstimatedSize;
             this.Controls.Add(rbAVI);

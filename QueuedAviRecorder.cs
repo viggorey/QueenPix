@@ -22,6 +22,9 @@ namespace QueenPix
     /// returns the SDK buffer at once; a writer thread saves frames from the pool to disk. A disk
     /// pause only makes the queue longer. If the pool ever runs out, the frame is counted as lost
     /// (never silent). Arrival times are kept for the per-camera timeline in the log.
+    ///
+    /// Loop mode (loopFrames &gt; 0): nothing is written while recording. The pool holds the last
+    /// loopFrames frames (the oldest is reused when it is full); Finish writes them, oldest first.
     /// </summary>
     internal sealed class QueuedAviRecorder
     {
@@ -33,18 +36,23 @@ namespace QueenPix
         private readonly byte[][] _pool;
         private readonly ConcurrentQueue<int> _free = new ConcurrentQueue<int>();
         private readonly BlockingCollection<int> _filled = new BlockingCollection<int>(new ConcurrentQueue<int>());
-        private readonly Thread _writer;
+        private readonly Thread? _writer;                         // null in loop mode
+        private readonly bool _loop;
+        private readonly long[]? _slotTicks;                      // loop mode: arrival time per pool slot
         private readonly long[] _arrivalTicks = new long[2_000_000];   // ~2.5 h at 218 Hz
         private int _arrivals;
 
         private bool _formatChecked, _formatOk, _bottomUp;
-        private long _framesQueued, _framesWritten, _lostNoBuffer, _lostBadFormat, _lostWriteError;
+        private long _framesQueued, _framesWritten, _lostNoBuffer, _lostBadFormat, _lostWriteError, _overwritten;
         private int _maxQueueDepth;
         private volatile Exception? _writerError;
         private volatile Exception? _callbackError;
         private bool _finished;
         private double _finalFps;
         private long _lastPreviewTicks;
+        private volatile bool _snapshotRequested;
+        private byte[]? _snapshot;
+        private readonly ManualResetEventSlim _snapshotReady = new ManualResetEventSlim(false);
 
         public FrameQueueSink Sink { get; }
 
@@ -54,7 +62,10 @@ namespace QueenPix
         /// owns the bitmap and must dispose it. Null = no preview.
         /// </summary>
         public Action<System.Drawing.Bitmap>? PreviewFrame { get; set; }
-        public int PreviewIntervalMs { get; set; } = 500;
+        public int PreviewIntervalMs { get; set; } = 200;   // 5 preview frames per second
+        public bool IsLoop => _loop;
+        /// <summary>Loop mode, after Finish: when the first saved frame arrived.</summary>
+        public DateTime? OldestKeptTime { get; private set; }
         public long FramesWritten => Interlocked.Read(ref _framesWritten);
         public long FramesLost => Interlocked.Read(ref _lostNoBuffer) + Interlocked.Read(ref _lostBadFormat)
                                   + Interlocked.Read(ref _lostWriteError);
@@ -64,7 +75,7 @@ namespace QueenPix
         public long FramesReceived => Interlocked.Read(ref _framesQueued);
 
         public QueuedAviRecorder(string path, string label, int width, int height, double fps, int bufferMB,
-                                 Action<string> log)
+                                 Action<string> log, int loopFrames = 0)
         {
             if (width <= 0 || height <= 0)
                 throw new ArgumentException($"{label}: invalid image size {width}x{height}");
@@ -76,7 +87,10 @@ namespace QueenPix
             _fps = fps > 0 ? fps : 200;
             _log = log;
 
-            int poolFrames = (int)Math.Max(100, (long)bufferMB * 1024 * 1024 / _frameBytes);
+            _loop = loopFrames > 0;
+            int poolFrames = _loop ? loopFrames
+                                   : (int)Math.Max(100, (long)bufferMB * 1024 * 1024 / _frameBytes);
+            if (_loop) _slotTicks = new long[poolFrames];
             _pool = new byte[poolFrames][];
             for (int k = 0; k < poolFrames; k++)
             {
@@ -86,16 +100,23 @@ namespace QueenPix
 
             Sink = new FrameQueueSink(OnFrameQueued, MediaSubtypes.Y800, 32);
 
-            _writer = new Thread(WriterLoop)
+            if (!_loop)
             {
-                IsBackground = true,
-                Name = $"AVI writer {label}",
-                Priority = ThreadPriority.AboveNormal
-            };
-            _writer.Start();
-
-            _log($"{_label}: buffered recording ready - RAM buffer {poolFrames} frames ({bufferMB} MB), " +
-                 $"{width}x{height} Y800");
+                _writer = new Thread(WriterLoop)
+                {
+                    IsBackground = true,
+                    Name = $"AVI writer {label}",
+                    Priority = ThreadPriority.AboveNormal
+                };
+                _writer.Start();
+                _log($"{_label}: buffered recording ready - RAM buffer {poolFrames} frames ({bufferMB} MB), " +
+                     $"{width}x{height} Y800");
+            }
+            else
+            {
+                _log($"{_label}: loop recording ready - keeps the last {poolFrames} frames " +
+                     $"({(long)poolFrames * _frameBytes / (1024 * 1024)} MB), {width}x{height} Y800");
+            }
         }
 
         // Runs on the SDK's sink thread for every frame. Must never wait for anything.
@@ -124,8 +145,15 @@ namespace QueenPix
                 }
                 if (!_free.TryDequeue(out int idx))
                 {
-                    Interlocked.Increment(ref _lostNoBuffer);
-                    return FrameQueuedResult.ReQueue;
+                    if (_loop && _filled.TryTake(out idx))
+                    {
+                        _overwritten++;                      // loop full: reuse the oldest frame
+                    }
+                    else
+                    {
+                        Interlocked.Increment(ref _lostNoBuffer);
+                        return FrameQueuedResult.ReQueue;
+                    }
                 }
 
                 IntPtr src = buf.GetIntPtr();
@@ -141,8 +169,14 @@ namespace QueenPix
                     Marshal.Copy(src, dst, 0, _frameBytes);
                 }
 
+                if (_slotTicks != null) _slotTicks[idx] = now;
                 _filled.Add(idx);
                 Interlocked.Increment(ref _framesQueued);
+                if (_loop)                           // no writer thread in loop mode
+                {
+                    MaybeSendPreview(dst);
+                    MaybeServeSnapshot(dst);
+                }
                 int depth = _filled.Count;
                 if (depth > _maxQueueDepth) _maxQueueDepth = depth;
             }
@@ -169,6 +203,7 @@ namespace QueenPix
                             avi.WriteFrame(_pool[idx], _frameBytes);
                             Interlocked.Increment(ref _framesWritten);
                             MaybeSendPreview(_pool[idx]);
+                            MaybeServeSnapshot(_pool[idx]);
                         }
                         catch (Exception ex)
                         {
@@ -197,13 +232,37 @@ namespace QueenPix
             long now = Stopwatch.GetTimestamp();
             if (now - _lastPreviewTicks < PreviewIntervalMs * Stopwatch.Frequency / 1000) return;
             _lastPreviewTicks = now;
-            try { receiver(MakePreviewBitmap(frame)); } catch { /* preview must never stop recording */ }
+            try { receiver(MakeBitmap(frame, 2)); } catch { /* preview must never stop recording */ }
         }
 
-        // Half-size 8-bit grayscale bitmap of a (top-down) frame.
-        private System.Drawing.Bitmap MakePreviewBitmap(byte[] frame)
+        /// <summary>
+        /// Full-size copy of the next recorded frame (screenshot while recording), or null if no
+        /// frame arrives within timeoutMs (e.g. trigger off).
+        /// </summary>
+        public System.Drawing.Bitmap? TakeSnapshot(int timeoutMs = 1000)
         {
-            int w = _width / 2, h = _height / 2;
+            if (_finished) return null;
+            _snapshotReady.Reset();
+            _snapshot = null;
+            _snapshotRequested = true;
+            bool got = _snapshotReady.Wait(timeoutMs);
+            _snapshotRequested = false;
+            byte[]? data = _snapshot;
+            return got && data != null ? MakeBitmap(data, 1) : null;
+        }
+
+        private void MaybeServeSnapshot(byte[] frame)
+        {
+            if (!_snapshotRequested) return;
+            _snapshotRequested = false;
+            _snapshot = (byte[])frame.Clone();
+            _snapshotReady.Set();
+        }
+
+        // 8-bit grayscale bitmap of a (top-down) frame; step 2 = half size (preview), 1 = full size.
+        private System.Drawing.Bitmap MakeBitmap(byte[] frame, int step)
+        {
+            int w = _width / step, h = _height / step;
             var bmp = new System.Drawing.Bitmap(w, h, System.Drawing.Imaging.PixelFormat.Format8bppIndexed);
             System.Drawing.Imaging.ColorPalette pal = bmp.Palette;
             for (int k = 0; k < 256; k++) pal.Entries[k] = System.Drawing.Color.FromArgb(k, k, k);
@@ -216,8 +275,8 @@ namespace QueenPix
                 var row = new byte[w];
                 for (int y = 0; y < h; y++)
                 {
-                    int src = 2 * y * _width;
-                    for (int x = 0; x < w; x++) row[x] = frame[src + 2 * x];
+                    int src = step * y * _width;
+                    for (int x = 0; x < w; x++) row[x] = frame[src + step * x];
                     Marshal.Copy(row, 0, data.Scan0 + y * data.Stride, w);
                 }
             }
@@ -234,10 +293,14 @@ namespace QueenPix
             double measured = MeasuredFps();
             _finalFps = measured > 0 ? measured : _fps;   // AVI header gets the real trigger rate
             _filled.CompleteAdding();
-            _writer.Join();
+            if (_loop) WriteLoopBuffer();
+            else _writer!.Join();
 
             long sinkDropped = 0;
             try { sinkDropped = Sink.CountOfFramesDropped; } catch { }
+            if (_loop)
+                _log($"{_label}: loop recording - saved the last {FramesWritten} frames " +
+                     $"(of {Interlocked.Read(ref _framesQueued)} received, {_overwritten} older ones dropped by the loop)");
             _log($"{_label}: buffered recording - received {Interlocked.Read(ref _framesQueued)}, " +
                  $"written {FramesWritten}, max queue {_maxQueueDepth} frames ({_maxQueueDepth / _finalFps:F2} s; " +
                  $"buffer {_pool.Length}), lost: buffer full {Interlocked.Read(ref _lostNoBuffer)}, " +
@@ -251,6 +314,49 @@ namespace QueenPix
             // release the RAM buffer
             while (_free.TryDequeue(out _)) { }
             for (int k = 0; k < _pool.Length; k++) _pool[k] = null!;
+        }
+
+        // Loop mode: write the kept frames, oldest first (called by Finish, after LiveStop).
+        private void WriteLoopBuffer()
+        {
+            AviWriter? avi = null;
+            bool first = true;
+            try
+            {
+                while (_filled.TryTake(out int idx))
+                {
+                    if (first && _slotTicks != null)
+                    {
+                        first = false;
+                        OldestKeptTime = DateTime.Now.AddSeconds(
+                            -(Stopwatch.GetTimestamp() - _slotTicks[idx]) / (double)Stopwatch.Frequency);
+                    }
+                    if (_writerError == null)
+                    {
+                        try
+                        {
+                            avi ??= new AviWriter(_path, _width, _height, _fps);
+                            avi.WriteFrame(_pool[idx], _frameBytes);
+                            Interlocked.Increment(ref _framesWritten);
+                        }
+                        catch (Exception ex)
+                        {
+                            _writerError = ex;
+                            Interlocked.Increment(ref _lostWriteError);
+                        }
+                    }
+                    else
+                    {
+                        Interlocked.Increment(ref _lostWriteError);
+                    }
+                    _free.Enqueue(idx);
+                }
+            }
+            finally
+            {
+                try { avi?.Close(_finalFps); }
+                catch (Exception ex) { if (_writerError == null) _writerError = ex; }
+            }
         }
 
         public void DisposeSink()

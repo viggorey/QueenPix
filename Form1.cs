@@ -113,26 +113,10 @@ namespace QueenPix
             public DateTime? RecordingStopTime { get; set; }
             public TextBox NameTextBox { get; set; }
             public string CustomName { get; set; }
-            public Queue<System.Drawing.Bitmap>? LoopBuffer { get; set; }
-            public int MaxLoopFrames { get; set; }
-            public object LoopBufferLock { get; set; }
-            public Task? LoopCaptureTask { get; set; }
-            public CancellationTokenSource? LoopCancelToken { get; set; }
-            public long LastFrameNumber { get; set; } = -1;
+            public int MaxLoopFrames { get; set; }        // loop recording: frames kept
             public int DroppedFrames { get; set; }
-            public long ExpectedFrameCount { get; set; }
-            // Real frame timing during a recording (arrival time of the first and last frame),
-            // used to report the TRUE frame rate instead of Start/Stop button times.
-            public volatile bool RecTimingActive;
-            public long RecFirstFrameTicks;
-            public long RecLastFrameTicks;
-            public long RecFrameEvents;
             public bool HardwareTriggerEnabledByApp;
-            // File-growth samples (time, bytes) of the recording AVI - used when the camera
-            // does not raise per-frame events during recording (MediaStreamSink).
-            public List<(long ticks, long bytes)> RecFileSamples = new List<(long ticks, long bytes)>();
-            public object RecFileSamplesLock = new object();
-            // Buffered recording (RAM queue + writer thread) of the current normal recording, if used
+            // Recorder of the current normal or loop recording (RAM queue, see QueuedAviRecorder)
             public QueuedAviRecorder? QueuedRecorder { get; set; }
             // Light preview shown over the camera view while recording with the live display off
             public PictureBox? RecordingPreview { get; set; }
@@ -198,9 +182,7 @@ namespace QueenPix
                 Settings = new CameraSettings();
                 NameTextBox = new TextBox();
                 CustomName = "";
-                LoopBuffer = null;
                 MaxLoopFrames = 0;
-                LoopBufferLock = new object();
             }
         }
         private class SystemInfo
@@ -250,6 +232,7 @@ namespace QueenPix
         private Button btnStartLive = null!;
         private Button btnStopLive = null!;
         private Button btnLiveToggle = null!;   // the visible Start/Stop Live button
+        private Button btnRecordToggle = null!; // the visible Start/Stop Recording button
         private Button btnStartRecording = null!;
         private Button btnStopRecording = null!;
         private Button btnScreenshot = null!;
@@ -276,8 +259,6 @@ namespace QueenPix
         private bool isRecording = false;
         // Normal recordings: frames go into a RAM queue and a writer thread saves them, so a slow
         // moment on the disk can no longer make the cameras skip triggers (see QueuedAviRecorder).
-        // Off = old direct MediaStreamSink path.
-        private bool _useBufferedRecording = true;
         private const int RecordBufferMBPerCamera = 1024;
         private bool isTimelapseMode = false; // class-level flag for webcam capture loop
         private string currentRecordingBaseName = ""; // Store the timestamp-based name
@@ -420,12 +401,6 @@ namespace QueenPix
                 BtnRefreshCameras_Click(null, EventArgs.Empty);
                 e.Handled = true;
             }
-            // Ctrl+B - Run Frame Drop Tester
-            else if (e.Control && e.KeyCode == Keys.B)
-            {
-                RunRecordingTest();
-                e.Handled = true;
-            }
             // Escape - Collapse expanded camera
             else if (e.KeyCode == Keys.Escape)
             {
@@ -474,9 +449,6 @@ namespace QueenPix
             ToolStripMenuItem capacityCalcItem = new ToolStripMenuItem("Loop Recording RAM Calculator...");
             capacityCalcItem.Click += (s, e) => ShowCapacityCalculator();
             toolsMenu.DropDownItems.Add(capacityCalcItem);
-            ToolStripMenuItem recordingTestItem = new ToolStripMenuItem("Recording Test...");
-            recordingTestItem.Click += (s, e) => RunRecordingTest();
-            toolsMenu.DropDownItems.Add(recordingTestItem);
 
             toolsMenu.DropDownItems.Add(new ToolStripSeparator());
             ToolStripMenuItem centrifugeItem = new ToolStripMenuItem("Centrifuge Analysis...");
@@ -494,13 +466,6 @@ namespace QueenPix
             settingsMenu.DropDownItems.Add(profilesItem);
 
 
-            ToolStripMenuItem bufferedItem = new ToolStripMenuItem("Buffered recording (RAM queue) - recommended")
-            {
-                CheckOnClick = true,
-                Checked = _useBufferedRecording
-            };
-            bufferedItem.CheckedChanged += (s, e) => _useBufferedRecording = bufferedItem.Checked;
-            settingsMenu.DropDownItems.Add(bufferedItem);
             
             settingsMenu.DropDownItems.Add(new ToolStripSeparator());
             ToolStripMenuItem exportSettingsItem = new ToolStripMenuItem("Export Settings...");
@@ -859,11 +824,30 @@ namespace QueenPix
             btnStopRecording.Click += BtnStopRecording_Click;
             this.Controls.Add(btnStopRecording);
 
+            // One visible Record button, mirroring the (hidden) start/stop buttons' state
+            btnStartRecording.Visible = false;
+            btnStopRecording.Visible = false;
+            btnRecordToggle = new Button
+            {
+                Text = "Start Recording",
+                Location = ScalePoint(buttonX + buttonSpacing * 2, buttonY),
+                Size = ScaleSize(buttonWidth, 30),
+                Enabled = false
+            };
+            btnRecordToggle.Click += (s, e) =>
+            {
+                if (btnStopRecording.Enabled) BtnStopRecording_Click(null, EventArgs.Empty);
+                else if (btnStartRecording.Enabled) BtnStartRecording_Click(null, EventArgs.Empty);
+            };
+            btnStartRecording.EnabledChanged += (s, e) => UpdateRecordToggle();
+            btnStopRecording.EnabledChanged += (s, e) => UpdateRecordToggle();
+            this.Controls.Add(btnRecordToggle);
+
             // Add after btnStopRecording setup (around line 258)
             Button btnManageCameras = new Button
             {
                 Text = "Manage Cameras",
-                Location = ScalePoint(buttonX + buttonSpacing * 4, buttonY),
+                Location = ScalePoint(buttonX + buttonSpacing * 3, buttonY),
                 Size = ScaleSize(buttonWidth, 30)
             };
             btnManageCameras.Click += BtnManageCameras_Click;
@@ -873,7 +857,7 @@ namespace QueenPix
             btnScreenshot = new Button  // ← Changed from "Button btnScreenshot" to "btnScreenshot"
             {
                 Text = "📷 Screenshot",
-                Location = ScalePoint(buttonX + buttonSpacing * 5, buttonY),
+                Location = ScalePoint(buttonX + buttonSpacing * 4, buttonY),
                 Size = ScaleSize(buttonWidth, 30),
                 Enabled = false
             };
@@ -883,7 +867,7 @@ namespace QueenPix
             btnManageGroups = new Button
             {
                 Text = "👥 Groups",
-                Location = ScalePoint(buttonX + buttonSpacing * 6, buttonY),
+                Location = ScalePoint(buttonX + buttonSpacing * 5, buttonY),
                 Size = ScaleSize(buttonWidth, 30)
             };
             btnManageGroups.Click += (s, e) => ShowGroupsDialog();
@@ -1238,23 +1222,6 @@ namespace QueenPix
                 Visible = false
             };
             this.Controls.Add(_groupButtonPanel);
-        }
-        private System.Drawing.Bitmap DeepCloneBitmap(System.Drawing.Bitmap source)
-        {
-            // Create a new bitmap with RGB format (safer and more compatible)
-            System.Drawing.Bitmap clone = new System.Drawing.Bitmap(
-                source.Width, 
-                source.Height, 
-                System.Drawing.Imaging.PixelFormat.Format24bppRgb);
-            
-            // Use Graphics to draw the source onto the clone
-            // This is slower but much more reliable
-            using (System.Drawing.Graphics g = System.Drawing.Graphics.FromImage(clone))
-            {
-                g.DrawImage(source, 0, 0, source.Width, source.Height);
-            }
-            
-            return clone;
         }
         
         /// <summary>
@@ -1907,1610 +1874,6 @@ namespace QueenPix
             calcForm.AcceptButton = btnClose;
             calcForm.ShowDialog();
         }
-        private void RunRecordingTest()
-        {
-            if (cameras.Count == 0)
-            {
-                MessageBox.Show("Please connect and detect cameras first!\n\nClick 'Refresh Cameras' to detect cameras.",
-                                "No Cameras", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
-            
-            if (isRecording)
-            {
-                MessageBox.Show("Cannot run frame drop tester while recording!",
-                                "Busy", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
-            
-            // STEP 1: Choose test type
-            Form testTypeForm = new Form
-            {
-                Text = "Recording Test",
-                Size = new System.Drawing.Size(470, 240),
-                StartPosition = FormStartPosition.CenterParent,
-                FormBorderStyle = FormBorderStyle.FixedDialog,
-                MaximizeBox = false,
-                MinimizeBox = false
-            };
-            
-            int y = 30;
-            
-            Label lblQuestion = new Label
-            {
-                Text = "What type of recording do you want to test?",
-                Location = new System.Drawing.Point(30, y),
-                Size = new System.Drawing.Size(410, 25),
-                Font = new System.Drawing.Font("Arial", 10, System.Drawing.FontStyle.Bold)
-            };
-            testTypeForm.Controls.Add(lblQuestion);
-            y += 45;
-            
-            Button btnLoopTest = new Button
-            {
-                Text = "Loop Recording Test",
-                Location = new System.Drawing.Point(45, y),
-                Size = new System.Drawing.Size(180, 50),
-                Font = new System.Drawing.Font("Arial", 10)
-            };
-            testTypeForm.Controls.Add(btnLoopTest);
-            
-            Button btnVideoTest = new Button
-            {
-                Text = "Video Recording Test",
-                Location = new System.Drawing.Point(245, y),
-                Size = new System.Drawing.Size(180, 50),
-                Font = new System.Drawing.Font("Arial", 10)
-            };
-            testTypeForm.Controls.Add(btnVideoTest);
-            y += 75;
-            
-            Button btnCancel = new Button
-            {
-                Text = "Cancel",
-                Location = new System.Drawing.Point(185, y),
-                Size = new System.Drawing.Size(100, 35),
-                DialogResult = DialogResult.Cancel
-            };
-            testTypeForm.Controls.Add(btnCancel);
-            testTypeForm.CancelButton = btnCancel;
-            
-            bool isLoopTest = false;
-            bool testChosen = false;
-            
-            btnLoopTest.Click += (s, e) =>
-            {
-                isLoopTest = true;
-                testChosen = true;
-                testTypeForm.DialogResult = DialogResult.OK;
-                testTypeForm.Close();
-            };
-            
-            btnVideoTest.Click += (s, e) =>
-            {
-                isLoopTest = false;
-                testChosen = true;
-                testTypeForm.DialogResult = DialogResult.OK;
-                testTypeForm.Close();
-            };
-            
-            if (testTypeForm.ShowDialog() != DialogResult.OK || !testChosen)
-                return;
-            
-            // STEP 2: Configure test parameters using unified dialog
-            Dictionary<int, double> cameraExpectedFps = new Dictionary<int, double>();
-            double testDuration = 0;
-            double loopDuration = 0;
-            
-            if (isLoopTest)
-            {
-                // Configure Loop Test - unified dialog with loop duration
-                if (!ConfigureRecordingTest(isLoopTest: true, out cameraExpectedFps, out testDuration, out loopDuration))
-                    return;
-            }
-            else
-            {
-                // Configure Video Test - unified dialog without loop duration
-                if (!ConfigureRecordingTest(isLoopTest: false, out cameraExpectedFps, out testDuration, out loopDuration))
-                    return;
-            }
-            
-            // STEP 3: Run the test
-            if (isLoopTest)
-            {
-                RunLoopRecordingTest(cameraExpectedFps, loopDuration);
-            }
-            else
-            {
-                RunVideoRecordingTest(cameraExpectedFps, testDuration);
-            }
-        }
-
-        private bool ConfigureRecordingTest(bool isLoopTest, out Dictionary<int, double> cameraExpectedFps, out double testDuration, out double loopDuration)
-        {
-            cameraExpectedFps = new Dictionary<int, double>();
-            testDuration = 15.0;
-            loopDuration = 30.0;
-            
-            string testType = isLoopTest ? "Loop Recording Test" : "Video Recording Test";
-            int baseHeight = isLoopTest ? 280 : 240;
-            
-            Form configForm = new Form
-            {
-                Text = $"Configure {testType}",
-                Size = new System.Drawing.Size(500, baseHeight + (cameras.Count * 40)),
-                StartPosition = FormStartPosition.CenterParent,
-                FormBorderStyle = FormBorderStyle.FixedDialog,
-                MaximizeBox = false,
-                MinimizeBox = false
-            };
-            
-            int y = 20;
-            
-            Label lblInfo = new Label
-            {
-                Text = "Set expected FPS for each camera:",
-                Location = new System.Drawing.Point(20, y),
-                Size = new System.Drawing.Size(450, 20),
-                Font = new System.Drawing.Font("Arial", 9, System.Drawing.FontStyle.Bold)
-            };
-            configForm.Controls.Add(lblInfo);
-            y += 30;
-            
-            // FPS controls for each camera
-            List<NumericUpDown> fpsControls = new List<NumericUpDown>();
-            CheckBox chkApplyAll = null;
-            
-            for (int i = 0; i < cameras.Count; i++)
-            {
-                Label lblCamera = new Label
-                {
-                    Text = $"{cameras[i].CustomName}:",
-                    Location = new System.Drawing.Point(40, y + 2),
-                    Size = new System.Drawing.Size(150, 20)
-                };
-                configForm.Controls.Add(lblCamera);
-                
-                // Auto-detect expected FPS if not already set
-                decimal defaultFps;
-                if (cameras[i].Settings.UseExternalTrigger)
-                {
-                    defaultFps = (decimal)numExternalTriggerFps.Value;
-                }
-                else if (cameras[i].Settings.SoftwareFrameRate > 0)
-                {
-                    defaultFps = (decimal)cameras[i].Settings.SoftwareFrameRate;
-                }
-                else
-                {
-                    // Default to 30 fps if not set
-                    defaultFps = 30.0m;
-                }
-                
-                NumericUpDown numFps = new NumericUpDown
-                {
-                    Location = new System.Drawing.Point(200, y),
-                    Size = new System.Drawing.Size(80, 25),
-                    Minimum = 1,
-                    Maximum = 1000,
-                    DecimalPlaces = 1,
-                    Value = defaultFps
-                };
-                configForm.Controls.Add(numFps);
-                fpsControls.Add(numFps);
-                
-                Label lblFpsUnit = new Label
-                {
-                    Text = "fps",
-                    Location = new System.Drawing.Point(290, y + 2),
-                    Size = new System.Drawing.Size(30, 20)
-                };
-                configForm.Controls.Add(lblFpsUnit);
-                
-                // Add "Apply to All" checkbox after first camera
-                if (i == 0)
-                {
-                    chkApplyAll = new CheckBox
-                    {
-                        Text = "Apply to All",
-                        Location = new System.Drawing.Point(330, y + 2),
-                        Size = new System.Drawing.Size(120, 20)
-                    };
-                    
-                    chkApplyAll.CheckedChanged += (s, e) =>
-                    {
-                        if (chkApplyAll.Checked)
-                        {
-                            double firstFps = (double)fpsControls[0].Value;
-                            for (int j = 1; j < fpsControls.Count; j++)
-                            {
-                                fpsControls[j].Value = (decimal)firstFps;
-                                fpsControls[j].Enabled = false;
-                            }
-                        }
-                        else
-                        {
-                            for (int j = 1; j < fpsControls.Count; j++)
-                            {
-                                fpsControls[j].Enabled = true;
-                            }
-                        }
-                    };
-                    
-                    // Also apply when first camera FPS changes and "Apply to All" is checked
-                    fpsControls[0].ValueChanged += (s, e) =>
-                    {
-                        if (chkApplyAll.Checked)
-                        {
-                            double firstFps = (double)fpsControls[0].Value;
-                            for (int j = 1; j < fpsControls.Count; j++)
-                            {
-                                fpsControls[j].Value = (decimal)firstFps;
-                            }
-                        }
-                    };
-                    
-                    configForm.Controls.Add(chkApplyAll);
-                }
-                
-                y += 35;
-            }
-            
-            // Loop duration (only for loop test)
-            NumericUpDown numLoopDuration = null;
-            if (isLoopTest)
-            {
-                y += 10;
-                Label lblLoopDuration = new Label
-                {
-                    Text = "Loop Duration:",
-                    Location = new System.Drawing.Point(40, y + 2),
-                    Size = new System.Drawing.Size(150, 20),
-                    Font = new System.Drawing.Font("Arial", 9, System.Drawing.FontStyle.Bold)
-                };
-                configForm.Controls.Add(lblLoopDuration);
-                
-                numLoopDuration = new NumericUpDown
-                {
-                    Location = new System.Drawing.Point(200, y),
-                    Size = new System.Drawing.Size(80, 25),
-                    Minimum = 5,
-                    Maximum = 600,
-                    Value = (decimal)this.numLoopDuration.Value  // Default to current UI value
-                };
-                configForm.Controls.Add(numLoopDuration);
-                
-                Label lblLoopDurationUnit = new Label
-                {
-                    Text = "seconds",
-                    Location = new System.Drawing.Point(290, y + 2),
-                    Size = new System.Drawing.Size(60, 20)
-                };
-                configForm.Controls.Add(lblLoopDurationUnit);
-                y += 40;
-            }
-            
-            // Test recording length
-            y += 10;
-            Label lblDuration = new Label
-            {
-                Text = "Test Recording Length:",
-                Location = new System.Drawing.Point(40, y + 2),
-                Size = new System.Drawing.Size(150, 20),
-                Font = new System.Drawing.Font("Arial", 9, System.Drawing.FontStyle.Bold)
-            };
-            configForm.Controls.Add(lblDuration);
-            
-            NumericUpDown numDuration = new NumericUpDown
-            {
-                Location = new System.Drawing.Point(200, y),
-                Size = new System.Drawing.Size(80, 25),
-                Minimum = 5,
-                Maximum = 300,
-                Value = isLoopTest ? (numLoopDuration?.Value ?? 30) : 15  // Default to loop duration for loop test, 15 for video test
-            };
-            configForm.Controls.Add(numDuration);
-            
-            // If loop test, sync duration with loop duration when loop duration changes
-            if (isLoopTest && numLoopDuration != null)
-            {
-                numLoopDuration.ValueChanged += (s, e) =>
-                {
-                    numDuration.Value = numLoopDuration.Value;
-                };
-            }
-            
-            Label lblDurationUnit = new Label
-            {
-                Text = "seconds",
-                Location = new System.Drawing.Point(290, y + 2),
-                Size = new System.Drawing.Size(60, 20)
-            };
-            configForm.Controls.Add(lblDurationUnit);
-            
-            y += 40;
-            
-            Label lblNote = new Label
-            {
-                Text = isLoopTest 
-                    ? "Test will use loop recording mode regardless of current Recording Mode setting"
-                    : "Videos will be saved to your working folder for analysis",
-                Location = new System.Drawing.Point(40, y),
-                Size = new System.Drawing.Size(420, 20),
-                ForeColor = System.Drawing.Color.Blue,
-                Font = new System.Drawing.Font("Arial", 8)
-            };
-            configForm.Controls.Add(lblNote);
-            
-            y += 30;
-            
-            // Buttons
-            Button btnCancelConfig = new Button
-            {
-                Text = "Cancel",
-                Location = new System.Drawing.Point(220, y),
-                Size = new System.Drawing.Size(100, 35),
-                DialogResult = DialogResult.Cancel
-            };
-            configForm.Controls.Add(btnCancelConfig);
-            
-            Button btnStart = new Button
-            {
-                Text = "Start Test",
-                Location = new System.Drawing.Point(330, y),
-                Size = new System.Drawing.Size(120, 35),
-                DialogResult = DialogResult.OK
-            };
-            configForm.Controls.Add(btnStart);
-            
-            configForm.AcceptButton = btnStart;
-            configForm.CancelButton = btnCancelConfig;
-            
-            if (configForm.ShowDialog() != DialogResult.OK)
-            {
-                cameraExpectedFps = new Dictionary<int, double>();
-                testDuration = 0;
-                loopDuration = 0;
-                return false;
-            }
-            
-            // Collect settings
-            for (int i = 0; i < cameras.Count; i++)
-            {
-                cameraExpectedFps[i] = (double)fpsControls[i].Value;
-            }
-            testDuration = (double)numDuration.Value;
-            if (isLoopTest && numLoopDuration != null)
-            {
-                loopDuration = (double)numLoopDuration.Value;
-            }
-            else
-            {
-                loopDuration = 0; // Not used for video test
-            }
-            
-            // Log configuration
-            string testTypeName = isLoopTest ? "Loop Recording Test" : "Video Recording Test";
-            LogCameraInfo($"{testTypeName} Configuration:");
-            if (isLoopTest)
-            {
-                LogCameraInfo($"  Loop Duration: {loopDuration}s");
-            }
-            LogCameraInfo($"  Test Recording Length: {testDuration}s");
-            LogCameraInfo($"  Expected FPS values:");
-            for (int i = 0; i < cameras.Count; i++)
-            {
-                LogCameraInfo($"  {cameras[i].CustomName}: Expected FPS = {cameraExpectedFps[i]} fps ({ (cameras[i].Settings.UseExternalTrigger ? "external trigger" : "software controlled") })");
-            }
-            
-            return true;
-        }
-
-        // Helper method to check if current format is Y800/Mono8
-        private bool IsY800Format(ICImagingControl control)
-        {
-            try
-            {
-                // First try VideoFormatCurrent (if camera is running)
-                if (control?.VideoFormatCurrent != null)
-                {
-                    string format = control.VideoFormatCurrent.ToString();
-                    if (format.Contains("Y800") || format.Contains("Mono8"))
-                        return true;
-                }
-                
-                // Fallback: Check VideoFormat (the format that's been set)
-                if (control?.VideoFormat != null)
-                {
-                    string format = control.VideoFormat.ToString();
-                    if (format.Contains("Y800") || format.Contains("Mono8"))
-                        return true;
-                }
-                
-                // Also check saved settings
-                var camera = cameras.FirstOrDefault(c => c.ImagingControl == control);
-                if (camera?.Settings != null && !string.IsNullOrEmpty(camera.Settings.Format))
-                {
-                    string format = camera.Settings.Format;
-                    if (format.Contains("Y800") || format.Contains("Mono8"))
-                        return true;
-                }
-            }
-            catch { }
-            
-            return false;
-        }
-
-        private void RunLoopRecordingTest(Dictionary<int, double> cameraExpectedFps, double loopDuration)
-        {
-            // Save current settings
-            bool wasLoopEnabled = chkLoopRecording.Checked;
-            int oldDuration = (int)numLoopDuration.Value;
-            double oldFps = (double)numExternalTriggerFps.Value;
-            string oldRecordingMode = cmbRecordingMode.SelectedItem?.ToString() ?? "Normal Recording";
-            
-            try
-            {
-                isBenchmarkMode = true;
-                
-                // Set recording mode to Loop Recording for test (regardless of current setting)
-                cmbRecordingMode.SelectedItem = "Loop Recording";
-                
-                // Configure loop recording for test
-                chkLoopRecording.Checked = true;
-                numLoopDuration.Value = (decimal)loopDuration;
-                numExternalTriggerFps.Enabled = true;
-                
-                // Use the loop duration directly (not 3x) - record for exactly that duration
-                double totalTestDuration = loopDuration;
-                
-                LogCameraInfo($"=== LOOP RECORDING TEST START ===");
-                LogCameraInfo($"Test duration: {totalTestDuration}s (using loop duration from configuration)");
-                LogCameraInfo($"Expected FPS values:");
-                for (int i = 0; i < cameras.Count; i++)
-                {
-                    LogCameraInfo($"  {cameras[i].CustomName}: {cameraExpectedFps[i]} fps");
-                }
-                LogCameraInfo($"Test logic: Record for {totalTestDuration}s, count frames, calculate actual FPS = frames/time, compare to expected FPS");
-                
-                // Create progress dialog
-                Form testForm = new Form
-                {
-                    Text = "Running Loop Recording Test...",
-                    Size = new System.Drawing.Size(550, 320),
-                    StartPosition = FormStartPosition.CenterParent,
-                    FormBorderStyle = FormBorderStyle.FixedDialog,
-                    MaximizeBox = false,
-                    MinimizeBox = false,
-                    ControlBox = false
-                };
-                
-                Label lblStatus = new Label
-                {
-                    Text = "Initializing test...",
-                    Location = new System.Drawing.Point(20, 20),
-                    Size = new System.Drawing.Size(460, 30),
-                    Font = new System.Drawing.Font("Arial", 10, System.Drawing.FontStyle.Bold)
-                };
-                testForm.Controls.Add(lblStatus);
-                
-                ProgressBar progressBar = new ProgressBar
-                {
-                    Location = new System.Drawing.Point(20, 60),
-                    Size = new System.Drawing.Size(360, 25),
-                    Minimum = 0,
-                    Maximum = (int)(totalTestDuration * 10),
-                    Value = 0
-                };
-                testForm.Controls.Add(progressBar);
-                
-                Label lblDetails = new Label
-                {
-                    Text = "",
-                    Location = new System.Drawing.Point(20, 100),
-                    Size = new System.Drawing.Size(460, 150),
-                    Font = new System.Drawing.Font("Consolas", 9)
-                };
-                testForm.Controls.Add(lblDetails);
-                
-                testForm.Show();
-                Application.DoEvents();
-                
-                
-                // Start cameras if not already live
-                bool needToStartLive = !cameras.Any(c => c.ImagingControl.LiveVideoRunning);
-                if (needToStartLive)
-                {
-                    foreach (var camera in cameras)
-                    {
-                        try
-                        {
-                            camera.ImagingControl.LiveStart();
-                            camera.LastFpsUpdate = DateTime.Now;
-                            camera.FrameCount = 0;
-                        }
-                        catch { }
-                    }
-                    System.Threading.Thread.Sleep(500);
-                }
-
-                // Reset counters
-                foreach (var camera in cameras)
-                {
-                    camera.DroppedFrames = 0;
-                    camera.ExpectedFrameCount = 0;
-                    camera.LastFrameNumber = -1;
-                }
-
-                // Start recording
-                lblStatus.Text = "Starting loop recording...";
-                Application.DoEvents();
-                BtnStartRecording_Click(null, EventArgs.Empty);
-
-                // ✅ Set testStart AFTER recording has actually started!
-                DateTime testStart = DateTime.Now;
-                
-                // Monitor during test
-                System.Windows.Forms.Timer testTimer = new System.Windows.Forms.Timer();
-                testTimer.Interval = 100;
-                
-                testTimer.Tick += (s, e) =>
-                {
-                    double elapsed = (DateTime.Now - testStart).TotalSeconds;
-                    
-                    int progressValue = Math.Max(0, Math.Min((int)(totalTestDuration * 10), (int)(elapsed * 10)));
-                    progressBar.Value = progressValue;
-                    
-                    lblStatus.Text = $"Test running... {elapsed:F1}s / {totalTestDuration:F1}s";
-                    
-                    // Show current stats
-                    string stats = "";
-                    int totalCaptured = 0;
-                    int totalDropped = 0;
-                    
-                    foreach (var camera in cameras)
-                    {
-                        int bufferSize = 0;
-                        if (camera.LoopBuffer != null)
-                        {
-                            lock (camera.LoopBufferLock)
-                            {
-                                bufferSize = camera.LoopBuffer.Count;
-                            }
-                        }
-                        
-                        int cameraIndex = cameras.IndexOf(camera);
-                        double expectedFps = cameraExpectedFps[cameraIndex];
-
-                        // Calculate expected frames based on THIS camera's actual recording time
-                        double cameraElapsed = elapsed;
-                        if (camera.RecordingStartTime.HasValue)
-                        {
-                            cameraElapsed = (DateTime.Now - camera.RecordingStartTime.Value).TotalSeconds;
-                        }
-                        int expectedFrames = (int)(cameraElapsed * expectedFps);  // ← Uses per-camera elapsed time
-                        int capturedFrames = (int)camera.ExpectedFrameCount;
-                        
-                        totalCaptured += capturedFrames;
-                        totalDropped += camera.DroppedFrames;
-                        
-                        stats += $"{camera.CustomName}:\n";
-                        stats += $"  Buffer: {bufferSize} frames\n";
-                        stats += $"  Expected: {expectedFrames} | Captured: {capturedFrames}\n";
-                        stats += $"  Dropped: {camera.DroppedFrames}\n\n";
-                    }
-                    
-                    lblDetails.Text = stats;
-                    
-                    if (elapsed >= totalTestDuration)
-                    {
-                        testTimer.Stop();
-                        testTimer.Dispose();
-                        
-                        // Stop recording without saving
-                        if (isRecording)
-                        {
-                            LogCameraInfo("=== LOOP TEST STOP (no file save) ===");
-                            
-                            foreach (var camera in cameras)
-                            {
-                                try
-                                {
-                                    camera.RecordingStopTime = DateTime.Now;
-                                    camera.ImagingControl.LiveStop();
-                                    
-                                    if (camera.LoopCancelToken != null)
-                                    {
-                                        camera.LoopCancelToken.Cancel();
-                                        camera.LoopCaptureTask?.Wait(1000);
-                                        camera.LoopCancelToken.Dispose();
-                                        camera.LoopCancelToken = null;
-                                        camera.LoopCaptureTask = null;
-                                    }
-                                    
-                                    // Clear loop buffer without saving
-                                    lock (camera.LoopBufferLock)
-                                    {
-                                        if (camera.LoopBuffer != null)
-                                        {
-                                            while (camera.LoopBuffer.Count > 0)
-                                            {
-                                                var frame = camera.LoopBuffer.Dequeue();
-                                                frame.Dispose();
-                                            }
-                                            camera.LoopBuffer = null;
-                                        }
-                                    }
-                                    
-                                    // Restore original sink and restart live
-                                    camera.ImagingControl.Sink = camera.OriginalSink;
-                                    camera.ImagingControl.LiveStart();
-                                }
-                                catch (Exception ex)
-                                {
-                                    LogCameraInfo($"Test cleanup error: {ex.Message}");
-                                }
-                            }
-
-                            // ✅ ADD THESE LINES HERE - Update button states after restarting cameras
-                            btnStartLive.Enabled = false;
-                            btnStopLive.Enabled = true;
-                            btnStartRecording.Enabled = true;
-                            btnScreenshot.Enabled = true;
-
-                            isRecording = false;
-                            btnStartRecording.Enabled = true;
-                            btnStopRecording.Enabled = false;
-                            chkLoopRecording.Enabled = true;
-                            numLoopDuration.Enabled = chkLoopRecording.Checked;
-                            // Re-enable recording mode dropdown
-                            cmbRecordingMode.Enabled = true;
-                        }
-                        
-                        testForm.Close();
-                        
-                        // Calculate and show results
-                        ShowLoopTestResults(cameraExpectedFps, totalTestDuration);
-                    }
-                };
-                
-                testTimer.Start();
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show($"Test failed: {ex.Message}",
-                                "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                LogCameraInfo($"Loop test ERROR: {ex.Message}");
-            }
-            finally
-            {
-                // Restore settings
-                chkLoopRecording.Checked = wasLoopEnabled;
-                numLoopDuration.Value = oldDuration;
-                numExternalTriggerFps.Value = (decimal)oldFps;
-                // Restore recording mode and re-enable dropdown
-                cmbRecordingMode.SelectedItem = oldRecordingMode;
-                cmbRecordingMode.Enabled = true;
-                isBenchmarkMode = false;
-            }
-        }
-
-        private void ShowLoopTestResults(Dictionary<int, double> cameraExpectedFps, double totalTestDuration)
-        {
-            Form resultsForm = new Form
-            {
-                Text = "Loop Recording Test Results",
-                Size = new System.Drawing.Size(750, 700),
-                StartPosition = FormStartPosition.CenterParent,
-                FormBorderStyle = FormBorderStyle.Sizable,
-                MinimumSize = new System.Drawing.Size(750, 700)
-            };
-            
-            int y = 20;
-            
-            // Calculate overall stats first
-            int totalExpected = 0;
-            int totalCaptured = 0;
-            int totalDropped = 0;
-            bool allGood = true;
-            bool allFpsAccurate = true;
-            
-            for (int i = 0; i < cameras.Count; i++)
-            {
-                var camera = cameras[i];
-                double expectedFps = cameraExpectedFps[i];
-                
-                double cameraDuration = totalTestDuration;
-                if (camera.RecordingStartTime.HasValue && camera.RecordingStopTime.HasValue)
-                {
-                    cameraDuration = (camera.RecordingStopTime.Value - camera.RecordingStartTime.Value).TotalSeconds;
-                }
-                
-                int expectedFrames = (int)(cameraDuration * expectedFps);
-                int capturedFrames = (int)camera.ExpectedFrameCount;
-                int droppedFrames = camera.DroppedFrames;
-                double dropRate = expectedFrames > 0 ? (droppedFrames / (double)expectedFrames) * 100 : 0;
-                double actualFps = cameraDuration > 0 ? capturedFrames / cameraDuration : 0;
-                double fpsAccuracy = expectedFps > 0 ? (actualFps / expectedFps) * 100 : 0;
-                
-                totalExpected += expectedFrames;
-                totalCaptured += capturedFrames;
-                totalDropped += droppedFrames;
-                
-                if (dropRate >= 5) allGood = false;
-                // Check if FPS accuracy is within acceptable range (95-105%)
-                if (Math.Abs(fpsAccuracy - 100) > 5) allFpsAccurate = false;
-            }
-            
-            // Overall verdict
-            double overallDropRate = totalExpected > 0 ? (totalDropped / (double)totalExpected) * 100 : 0;
-            double overallCaptureRate = totalExpected > 0 ? (totalCaptured / (double)totalExpected) * 100 : 0;
-            
-            string overallVerdict = "";
-            System.Drawing.Color overallVerdictColor;
-            
-            // EXCELLENT: No drops, capture rate close to 100%, and all cameras have accurate FPS
-            if (allGood && allFpsAccurate && overallDropRate == 0 && overallCaptureRate >= 99 && overallCaptureRate <= 101)
-            {
-                overallVerdict = "✅ EXCELLENT - Perfect capture!";
-                overallVerdictColor = System.Drawing.Color.Green;
-            }
-            // GOOD: Minimal drops, capture rate 95-105%, and FPS accuracy within 10%
-            else if (overallDropRate < 1 && overallCaptureRate >= 95 && overallCaptureRate <= 105)
-            {
-                overallVerdict = "✅ GOOD - Minimal frame loss";
-                overallVerdictColor = System.Drawing.Color.Green;
-            }
-            // ACCEPTABLE: Some drops or moderate FPS deviation
-            else if (overallDropRate < 5)
-            {
-                overallVerdict = "⚠️ ACCEPTABLE - Some frame drops or FPS accuracy issues detected";
-                overallVerdictColor = System.Drawing.Color.Orange;
-            }
-            // POOR: High drop rate or significant FPS deviation
-            else
-            {
-                overallVerdict = "❌ POOR - High frame drop rate or significant FPS accuracy issues";
-                overallVerdictColor = System.Drawing.Color.Red;
-            }
-            
-            Label lblVerdict = new Label
-            {
-                Text = overallVerdict,
-                Location = new System.Drawing.Point(20, y),
-                Size = new System.Drawing.Size(660, 40),
-                Font = new System.Drawing.Font("Arial", 14, System.Drawing.FontStyle.Bold),
-                ForeColor = overallVerdictColor
-            };
-            resultsForm.Controls.Add(lblVerdict);
-            y += 50;
-            
-            // Summary stats in a GroupBox
-            GroupBox grpSummary = new GroupBox
-            {
-                Text = "Test Summary",
-                Location = new System.Drawing.Point(20, y),
-                Size = new System.Drawing.Size(660, 140),
-                Font = new System.Drawing.Font("Arial", 10, System.Drawing.FontStyle.Bold)
-            };
-
-            Label lblSummaryContent = new Label
-            {
-                Text = $"Test Duration: {totalTestDuration:F1} seconds\n" +
-                    $"Cameras Tested: {cameras.Count}\n" +
-                    $"Total Expected Frames: {totalExpected:N0}\n" +
-                    $"Total Captured Frames: {totalCaptured:N0}\n" +
-                    $"Total Dropped Frames: {totalDropped:N0}\n" +
-                    $"Overall Capture Rate: {overallCaptureRate:F1}%",
-                Location = new System.Drawing.Point(15, 25),
-                Size = new System.Drawing.Size(630, 105),
-                Font = new System.Drawing.Font("Arial", 9)
-            };
-            grpSummary.Controls.Add(lblSummaryContent);
-            resultsForm.Controls.Add(grpSummary);
-            y += 150;
-
-            // Per-camera results in a GroupBox with scrollable panel
-            GroupBox grpDetails = new GroupBox
-            {
-                Text = "Per-Camera Results",
-                Location = new System.Drawing.Point(20, y),
-                Size = new System.Drawing.Size(660, 380),
-                Font = new System.Drawing.Font("Arial", 10, System.Drawing.FontStyle.Bold)
-            };
-
-            Panel detailsPanel = new Panel
-            {
-                Location = new System.Drawing.Point(15, 25),
-                Size = new System.Drawing.Size(630, 345),
-                AutoScroll = true,
-                BorderStyle = BorderStyle.FixedSingle
-            };
-
-            // Build per-camera results
-            int detailY = 10;
-            for (int i = 0; i < cameras.Count; i++)
-            {
-                var camera = cameras[i];
-                double expectedFps = cameraExpectedFps[i];
-                
-                double cameraDuration = totalTestDuration;
-                if (camera.RecordingStartTime.HasValue && camera.RecordingStopTime.HasValue)
-                {
-                    cameraDuration = (camera.RecordingStopTime.Value - camera.RecordingStartTime.Value).TotalSeconds;
-                }
-                
-                int expectedFrames = (int)(cameraDuration * expectedFps);
-                int capturedFrames = (int)camera.ExpectedFrameCount;
-                int droppedFrames = camera.DroppedFrames;
-                double dropRate = expectedFrames > 0 ? (droppedFrames / (double)expectedFrames) * 100 : 0;
-                double captureRate = expectedFrames > 0 ? (capturedFrames / (double)expectedFrames) * 100 : 0;
-                double actualFps = cameraDuration > 0 ? capturedFrames / cameraDuration : 0;
-                double fpsAccuracy = expectedFps > 0 ? (actualFps / expectedFps) * 100 : 0;
-                
-                string verdict = "";
-                System.Drawing.Color verdictColor;
-                // EXCELLENT: No drops, capture rate close to 100%, and FPS accuracy within 5%
-                if (dropRate == 0 && captureRate >= 99 && captureRate <= 101 && Math.Abs(fpsAccuracy - 100) <= 5)
-                {
-                    verdict = "✅ EXCELLENT";
-                    verdictColor = System.Drawing.Color.Green;
-                }
-                // GOOD: Minimal drops, capture rate 95-105%, and FPS accuracy within 10%
-                else if (dropRate < 1 && captureRate >= 95 && captureRate <= 105 && Math.Abs(fpsAccuracy - 100) <= 10)
-                {
-                    verdict = "✅ GOOD";
-                    verdictColor = System.Drawing.Color.Green;
-                }
-                // ACCEPTABLE: Some drops or moderate FPS deviation
-                else if (dropRate < 5 && Math.Abs(fpsAccuracy - 100) <= 20)
-                {
-                    verdict = "⚠️ ACCEPTABLE";
-                    verdictColor = System.Drawing.Color.Orange;
-                }
-                // POOR: High drop rate or significant FPS deviation
-                else
-                {
-                    verdict = "❌ POOR";
-                    verdictColor = System.Drawing.Color.Red;
-                }
-                
-                // Camera header
-                Label lblCameraHeader = new Label
-                {
-                    Text = $"{verdict} - {camera.CustomName}",
-                    Location = new System.Drawing.Point(10, detailY),
-                    Size = new System.Drawing.Size(600, 25),
-                    Font = new System.Drawing.Font("Arial", 10, System.Drawing.FontStyle.Bold),
-                    ForeColor = verdictColor,
-                    BackColor = System.Drawing.Color.FromArgb(240, 240, 240)
-                };
-                detailsPanel.Controls.Add(lblCameraHeader);
-                detailY += 30;
-                
-                // Expected values
-                Label lblExpected = new Label
-                {
-                    Text = $"Expected:  {expectedFrames:N0} frames @ {expectedFps:F1} fps",
-                    Location = new System.Drawing.Point(25, detailY),
-                    Size = new System.Drawing.Size(590, 20),
-                    Font = new System.Drawing.Font("Consolas", 9)
-                };
-                detailsPanel.Controls.Add(lblExpected);
-                detailY += 22;
-                
-                // Actual values
-                Label lblActual = new Label
-                {
-                    Text = $"Actual:    {capturedFrames:N0} frames in {cameraDuration:F2}s = {actualFps:F2} fps",
-                    Location = new System.Drawing.Point(25, detailY),
-                    Size = new System.Drawing.Size(590, 20),
-                    Font = new System.Drawing.Font("Consolas", 9),
-                    ForeColor = captureRate >= 95 ? System.Drawing.Color.Green : System.Drawing.Color.Red
-                };
-                detailsPanel.Controls.Add(lblActual);
-                detailY += 22;
-                
-                // Accuracy metrics
-                int frameDifference = capturedFrames - expectedFrames;
-                // fpsAccuracy already calculated above for verdict
-                string accuracyText = $"Capture Rate: {captureRate:F1}% ({frameDifference:+0;-0} frames)  |  " +
-                                    $"Dropped: {droppedFrames:N0} ({dropRate:F2}%)  |  " +
-                                    $"FPS Accuracy: {fpsAccuracy:F1}% (Expected: {expectedFps:F1} fps, Actual: {actualFps:F2} fps)";
-                Label lblAccuracy = new Label
-                {
-                    Text = accuracyText,
-                    Location = new System.Drawing.Point(25, detailY),
-                    Size = new System.Drawing.Size(590, 20),
-                    Font = new System.Drawing.Font("Arial", 8),
-                    ForeColor = System.Drawing.Color.Gray
-                };
-                detailsPanel.Controls.Add(lblAccuracy);
-                detailY += 22;
-                
-                // Recording info
-                Label lblRecording = new Label
-                {
-                    Text = $"Recording Duration: {cameraDuration:F2}s",
-                    Location = new System.Drawing.Point(25, detailY),
-                    Size = new System.Drawing.Size(590, 20),
-                    Font = new System.Drawing.Font("Arial", 7),
-                    ForeColor = System.Drawing.Color.DarkBlue
-                };
-                detailsPanel.Controls.Add(lblRecording);
-                detailY += 35;
-            }
-
-            grpDetails.Controls.Add(detailsPanel);
-            resultsForm.Controls.Add(grpDetails);
-            y += 390;
-
-            // Close button
-            Button btnClose = new Button
-            {
-                Text = "Close",
-                Location = new System.Drawing.Point(290, y),
-                Size = new System.Drawing.Size(100, 35),
-                DialogResult = DialogResult.OK,
-                Font = new System.Drawing.Font("Arial", 10)
-            };
-            resultsForm.Controls.Add(btnClose);
-            resultsForm.AcceptButton = btnClose;
-
-            LogCameraInfo($"=== LOOP TEST RESULTS ===");
-            LogCameraInfo($"Overall: {overallCaptureRate:F1}% capture rate, {overallDropRate:F2}% drop rate");
-
-            resultsForm.ShowDialog();
-        }
-
-        private void RunVideoRecordingTest(Dictionary<int, double> cameraExpectedFps, double testDuration)
-        {
-            // Save current settings
-            bool wasLoopEnabled = chkLoopRecording.Checked;
-            string oldRecordingMode = cmbRecordingMode.SelectedItem?.ToString() ?? "Normal Recording";
-            
-            try
-            {
-                isBenchmarkMode = true;
-                
-                // Set recording mode to Normal Recording for test (regardless of current setting)
-                cmbRecordingMode.SelectedItem = "Normal Recording";
-                
-                // Disable loop recording for video test
-                chkLoopRecording.Checked = false;
-                
-                LogCameraInfo($"=== VIDEO RECORDING TEST START ===");
-                LogCameraInfo($"Test duration: {testDuration}s");
-                
-                // Create progress dialog
-                Form testForm = new Form
-                {
-                    Text = "Running Video Recording Test...",
-                    Size = new System.Drawing.Size(550, 250),
-                    StartPosition = FormStartPosition.CenterParent,
-                    FormBorderStyle = FormBorderStyle.FixedDialog,
-                    MaximizeBox = false,
-                    MinimizeBox = false,
-                    ControlBox = false
-                };
-                
-                Label lblStatus = new Label
-                {
-                    Text = "Starting video recording...",
-                    Location = new System.Drawing.Point(20, 20),
-                    Size = new System.Drawing.Size(460, 30),
-                    Font = new System.Drawing.Font("Arial", 10, System.Drawing.FontStyle.Bold)
-                };
-                testForm.Controls.Add(lblStatus);
-                
-                ProgressBar progressBar = new ProgressBar
-                {
-                    Location = new System.Drawing.Point(20, 60),
-                    Size = new System.Drawing.Size(360, 25),
-                    Minimum = 0,
-                    Maximum = (int)(testDuration * 10),
-                    Value = 0
-                };
-                testForm.Controls.Add(progressBar);
-                
-                Label lblDetails = new Label
-                {
-                    Text = "Recording in progress...",
-                    Location = new System.Drawing.Point(20, 100),
-                    Size = new System.Drawing.Size(460, 100),
-                    Font = new System.Drawing.Font("Consolas", 9)
-                };
-                testForm.Controls.Add(lblDetails);
-                
-                testForm.Show();
-                Application.DoEvents();
-                
-                // Start cameras if not already live
-                bool needToStartLive = !cameras.Any(c => c.ImagingControl.LiveVideoRunning);
-                if (needToStartLive)
-                {
-                    foreach (var camera in cameras)
-                    {
-                        try
-                        {
-                            camera.ImagingControl.LiveStart();
-                            camera.LastFpsUpdate = DateTime.Now;
-                            camera.FrameCount = 0;
-                        }
-                        catch { }
-                    }
-                    System.Threading.Thread.Sleep(500);
-                }
-                
-                // Setup recording for each camera manually (NOT using BtnStartRecording_Click)
-                List<string> testVideoFiles = new List<string>();
-                List<MediaStreamSink> sinks = new List<MediaStreamSink>();
-                
-                string workingFolder = txtWorkingFolder.Text;
-                string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-                
-                for (int i = 0; i < cameras.Count; i++)
-                {
-                    var camera = cameras[i];
-                    
-                    try
-                    {
-                        // Stop camera
-                        if (camera.ImagingControl.LiveVideoRunning)
-                        {
-                            camera.ImagingControl.LiveStop();
-                        }
-                        
-                        // Save original sink
-                        camera.OriginalSink = camera.ImagingControl.Sink;
-                        
-                        // Create AVI file path
-                        string safeName = string.Join("_", camera.CustomName.Split(Path.GetInvalidFileNameChars()));
-                        if (string.IsNullOrWhiteSpace(safeName))
-                            safeName = $"Camera{i + 1}";
-                        
-                        string aviFile = Path.Combine(workingFolder, $"Test_{timestamp}_{safeName}.avi");
-                        testVideoFiles.Add(aviFile);
-                        
-                        // Check if Y800 format (requires FrameHandlerSink)
-                        // Log current format for debugging
-                        string currentFormatStr = "Unknown";
-                        try
-                        {
-                            if (camera.ImagingControl.VideoFormatCurrent != null)
-                                currentFormatStr = camera.ImagingControl.VideoFormatCurrent.ToString();
-                            else if (camera.ImagingControl.VideoFormat != null)
-                                currentFormatStr = camera.ImagingControl.VideoFormat.ToString();
-                            else if (camera.Settings != null && !string.IsNullOrEmpty(camera.Settings.Format))
-                                currentFormatStr = camera.Settings.Format;
-                        }
-                        catch { }
-                        
-                        LogCameraInfo($"{camera.CustomName}: Test recording - Checking format - Current: {currentFormatStr}");
-                        
-                        // All formats: Use MediaStreamSink (preserves quality)
-                        // Overlay will be applied during conversion/trimming using FFmpeg
-                        MediaStreamSink sink = new MediaStreamSink((AviCompressor?)null, aviFile);
-                        sinks.Add(sink);
-                        camera.ImagingControl.Sink = sink;
-                        camera.RecFrameEvents = 0;
-                        camera.RecTimingActive = true;
-                        
-                        LogCameraInfo($"{camera.CustomName}: Recording to {aviFile}");
-                    }
-                    catch (Exception ex)
-                    {
-                        LogCameraInfo($"Setup error for {camera.CustomName}: {ex.Message}");
-                    }
-                }
-                
-                // Start all cameras SYNCHRONOUSLY
-                DateTime recordingStart = DateTime.Now;
-                foreach (var camera in cameras)
-                {
-                    try
-                    {
-                        camera.ImagingControl.LiveStart();
-                        camera.RecordingStartTime = DateTime.Now;
-                        System.Threading.Thread.Sleep(10);  // Small delay between cameras
-                    }
-                    catch (Exception ex)
-                    {
-                        LogCameraInfo($"Start error for {camera.CustomName}: {ex.Message}");
-                    }
-                }
-                
-                LogCameraInfo($"All cameras started at {recordingStart:HH:mm:ss.fff}");
-                
-                // Simple blocking wait with progress updates
-                while ((DateTime.Now - recordingStart).TotalSeconds < testDuration)
-                {
-                    double elapsed = (DateTime.Now - recordingStart).TotalSeconds;
-                    
-                    progressBar.Value = Math.Min((int)(elapsed * 10), progressBar.Maximum);
-                    lblStatus.Text = $"Recording... {elapsed:F1}s / {testDuration:F1}s";
-                    
-                    string stats = $"Recording to disk...\n\n";
-                    stats += $"Cameras: {cameras.Count}\n";
-                    stats += $"Time elapsed: {elapsed:F1}s\n";
-                    stats += $"Time remaining: {(testDuration - elapsed):F1}s";
-                    
-                    lblDetails.Text = stats;
-                    
-                    Application.DoEvents();
-                    System.Threading.Thread.Sleep(100);
-                }
-                
-                DateTime recordingStop = DateTime.Now;
-                double actualDuration = (recordingStop - recordingStart).TotalSeconds;
-                
-                LogCameraInfo($"=== VIDEO TEST STOP ===");
-                LogCameraInfo($"Actual recording duration: {actualDuration:F2}s");
-                
-                lblStatus.Text = "Stopping and flushing files...";
-                Application.DoEvents();
-                
-                // CRITICAL: Stop cameras and properly close sinks
-                for (int i = 0; i < cameras.Count; i++)
-                {
-                    var camera = cameras[i];
-                    
-                    try
-                    {
-                        camera.RecordingStopTime = DateTime.Now;
-                        
-                        // Stop camera
-                        camera.ImagingControl.LiveStop();
-                        camera.RecTimingActive = false;
-                        
-                        // Restore original sink
-                        camera.ImagingControl.Sink = camera.OriginalSink;
-                        
-                        LogCameraInfo($"{camera.CustomName}: Stopped at {camera.RecordingStopTime.Value:HH:mm:ss.fff}");
-                    }
-                    catch (Exception ex)
-                    {
-                        LogCameraInfo($"Stop error for {camera.CustomName}: {ex.Message}");
-                    }
-                }
-                
-                // Wait for files to flush
-                System.Threading.Thread.Sleep(1000);
-                
-                // CRITICAL: Dispose all MediaStreamSinks to force file close
-                LogCameraInfo("Disposing MediaStreamSinks to flush files...");
-                foreach (var sink in sinks)
-                {
-                    try
-                    {
-                        sink.Dispose();
-                    }
-                    catch (Exception ex)
-                    {
-                        LogCameraInfo($"Sink dispose error: {ex.Message}");
-                    }
-                }
-                
-                // Wait for file system to catch up
-                System.Threading.Thread.Sleep(1000);
-                
-                // Restore original sinks and restart cameras
-                for (int i = 0; i < cameras.Count; i++)
-                {
-                    var camera = cameras[i];
-                    
-                    try
-                    {
-                        camera.ImagingControl.Sink = camera.OriginalSink;
-                        camera.ImagingControl.LiveStart();
-                    }
-                    catch (Exception ex)
-                    {
-                        LogCameraInfo($"Restart error for {camera.CustomName}: {ex.Message}");
-                    }
-                }
-
-                // ✅ UPDATE BUTTON STATES TO REFLECT LIVE MODE
-                btnStartLive.Enabled = false;
-                btnStopLive.Enabled = true;
-                btnStartRecording.Enabled = true;
-                btnScreenshot.Enabled = true;
-                
-                testForm.Close();
-                
-                LogCameraInfo("Waiting 2 seconds for final disk flush...");
-                System.Threading.Thread.Sleep(2000);
-                
-                // Calculate per-camera actual durations
-                Dictionary<int, double> actualCameraDurations = new Dictionary<int, double>();
-                for (int i = 0; i < cameras.Count; i++)
-                {
-                    if (cameras[i].RecordingStartTime.HasValue && cameras[i].RecordingStopTime.HasValue)
-                    {
-                        double cameraDuration = (cameras[i].RecordingStopTime.Value - cameras[i].RecordingStartTime.Value).TotalSeconds;
-                        actualCameraDurations[i] = cameraDuration;
-                        LogCameraInfo($"{cameras[i].CustomName}: Actual recording duration = {cameraDuration:F3}s");
-                    }
-                    else
-                    {
-                        // Fallback to test duration if timestamps missing
-                        actualCameraDurations[i] = actualDuration;
-                    }
-                }
-
-                // Analyze the recorded videos using per-camera actual durations
-                AnalyzeVideoTestResults(testVideoFiles, cameraExpectedFps, testDuration, actualCameraDurations);
-
-                // Clean up test video files after analysis
-                LogCameraInfo("Cleaning up test video files...");
-                foreach (string videoFile in testVideoFiles)
-                {
-                    try
-                    {
-                        if (File.Exists(videoFile))
-                        {
-                            File.Delete(videoFile);
-                            LogCameraInfo($"Deleted test file: {Path.GetFileName(videoFile)}");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        LogCameraInfo($"Failed to delete {Path.GetFileName(videoFile)}: {ex.Message}");
-                    }
-                }
-                LogCameraInfo("Test cleanup complete");
-           
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show($"Test failed: {ex.Message}",
-                                "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                LogCameraInfo($"Video test ERROR: {ex.Message}");
-            }
-            finally
-            {
-                // Restore settings
-                chkLoopRecording.Checked = wasLoopEnabled;
-                // Restore recording mode
-                cmbRecordingMode.SelectedItem = oldRecordingMode;
-                isBenchmarkMode = false;
-            }
-        }
-
-        private void AnalyzeVideoTestResults(List<string> videoFiles, Dictionary<int, double> cameraExpectedFps, double testDuration, Dictionary<int, double> actualCameraDurations)
-        {
-            // Create analysis progress form
-            Form analysisForm = new Form
-            {
-                Text = "Analyzing Videos...",
-                Size = new System.Drawing.Size(400, 150),
-                StartPosition = FormStartPosition.CenterParent,
-                FormBorderStyle = FormBorderStyle.FixedDialog,
-                MaximizeBox = false,
-                MinimizeBox = false,
-                ControlBox = false
-            };
-            
-            Label lblAnalyzing = new Label
-            {
-                Text = "Analyzing recorded videos, please wait...",
-                Location = new System.Drawing.Point(20, 50),
-                Size = new System.Drawing.Size(360, 40),
-                Font = new System.Drawing.Font("Arial", 10),
-                TextAlign = System.Drawing.ContentAlignment.MiddleCenter
-            };
-            analysisForm.Controls.Add(lblAnalyzing);
-            
-            analysisForm.Show();
-            Application.DoEvents();
-            
-            // Analyze each video
-            string detailedStats = "PER-CAMERA RESULTS:\n\n";
-            bool allGood = true;
-            int analyzedCount = 0;
-            
-            for (int i = 0; i < videoFiles.Count && i < cameras.Count; i++)
-            {
-                string videoFile = videoFiles[i];
-                
-                if (!File.Exists(videoFile))
-                {
-                    detailedStats += $"❌ {cameras[i].CustomName}:\n";
-                    detailedStats += $"   ERROR: Video file not found\n\n";
-                    allGood = false;
-                    continue;
-                }
-                
-                try
-                {
-                    int actualFrames = GetVideoFrameCount(videoFile);
-                    double storedFps = GetVideoFrameRate(videoFile);
-                    
-                    // Use the ACTUAL test duration, not the AVI metadata duration
-                    double actualDuration = testDuration;  // ← FIXED! Use actual recording time
-                    double calculatedFps = actualDuration > 0 ? actualFrames / actualDuration : 0;
-                    
-                    double expectedFps = cameraExpectedFps[i];
-                    int expectedFrames = (int)(testDuration * expectedFps);
-                    
-                    double fpsAccuracy = expectedFps > 0 ? (calculatedFps / expectedFps) * 100 : 0;
-                    int frameDifference = actualFrames - expectedFrames;
-                    double frameAccuracy = expectedFrames > 0 ? (actualFrames / (double)expectedFrames) * 100 : 0;
-                    
-                    string verdict = "";
-                    if (frameAccuracy >= 99 && Math.Abs(fpsAccuracy - 100) < 5)
-                        verdict = "✅";
-                    else if (frameAccuracy >= 95 && Math.Abs(fpsAccuracy - 100) < 10)
-                        verdict = "✅";
-                    else if (frameAccuracy >= 90)
-                        verdict = "⚠️";
-                    else
-                    {
-                        verdict = "❌";
-                        allGood = false;
-                    }
-                    
-                    detailedStats += $"{verdict} {cameras[i].CustomName}:\n";
-                    detailedStats += $"   Expected: {expectedFrames:N0} frames @ {expectedFps:F1} fps\n";
-                    detailedStats += $"   Actual: {actualFrames:N0} frames @ {calculatedFps:F1} fps\n";
-                    detailedStats += $"   Stored FPS: {storedFps:F1}\n";
-                    detailedStats += $"   Frame Accuracy: {frameAccuracy:F1}% ({frameDifference:+0;-0} frames)\n";
-                    detailedStats += $"   FPS Accuracy: {fpsAccuracy:F1}%\n";
-                    detailedStats += $"   Duration: {actualDuration:F2}s\n";
-                    detailedStats += $"   File: {Path.GetFileName(videoFile)}\n\n";
-                    
-                    analyzedCount++;
-                }
-                catch (Exception ex)
-                {
-                    detailedStats += $"❌ {cameras[i].CustomName}:\n";
-                    detailedStats += $"   ERROR: {ex.Message}\n\n";
-                    allGood = false;
-                }
-            }
-            
-            // Overall verdict
-            string overallVerdict = "";
-            System.Drawing.Color overallVerdictColor;  // ← RENAMED
-
-            if (allGood && analyzedCount == cameras.Count)
-            {
-                overallVerdict = "✅ EXCELLENT - All cameras recorded accurately!";
-                overallVerdictColor = System.Drawing.Color.Green;
-            }
-            else if (analyzedCount == cameras.Count)
-            {
-                overallVerdict = "⚠️ ACCEPTABLE - Some accuracy issues detected";
-                overallVerdictColor = System.Drawing.Color.Orange;
-            }
-            else
-            {
-                overallVerdict = "❌ POOR - Recording failures detected";
-                overallVerdictColor = System.Drawing.Color.Red;
-            }
-            
-            // Close analysis form
-            analysisForm.Close();
-            
-            // Create results form
-            Form resultsForm = new Form
-            {
-                Text = "Video Recording Test Results",
-                Size = new System.Drawing.Size(750, 600),  // ← INCREASED SIZE
-                StartPosition = FormStartPosition.CenterParent,
-                FormBorderStyle = FormBorderStyle.Sizable,
-                MinimumSize = new System.Drawing.Size(750, 600)  // ← INCREASED MINIMUM SIZE
-            };
-            
-            int y = 20;
-            
-            Label lblVerdict = new Label
-            {
-                Text = overallVerdict,
-                Location = new System.Drawing.Point(20, y),
-                Size = new System.Drawing.Size(660, 40),
-                Font = new System.Drawing.Font("Arial", 14, System.Drawing.FontStyle.Bold),
-                ForeColor = overallVerdictColor  // ← UPDATED
-            };
-            resultsForm.Controls.Add(lblVerdict);
-            y += 50;
-            
-            // Summary stats in a GroupBox
-            GroupBox grpSummary = new GroupBox
-            {
-                Text = "Test Summary",
-                Location = new System.Drawing.Point(20, y),
-                Size = new System.Drawing.Size(660, 120),
-                Font = new System.Drawing.Font("Arial", 10, System.Drawing.FontStyle.Bold)
-            };
-
-            Label lblSummaryContent = new Label
-            {
-                Text = $"Test Duration: {testDuration:F1} seconds\n" +
-                    $"Cameras Tested: {cameras.Count}\n" +
-                    $"Successfully Analyzed: {analyzedCount} / {cameras.Count}\n" +
-                    $"Videos Location: {Path.GetDirectoryName(videoFiles[0])}",
-                Location = new System.Drawing.Point(15, 25),
-                Size = new System.Drawing.Size(630, 85),
-                Font = new System.Drawing.Font("Arial", 9)
-            };
-            grpSummary.Controls.Add(lblSummaryContent);
-            resultsForm.Controls.Add(grpSummary);
-            y += 130;
-
-            // Per-camera results in a GroupBox with scrollable panel
-            GroupBox grpDetails = new GroupBox
-            {
-                Text = "Per-Camera Results",
-                Location = new System.Drawing.Point(20, y),
-                Size = new System.Drawing.Size(660, 280),
-                Font = new System.Drawing.Font("Arial", 10, System.Drawing.FontStyle.Bold)
-            };
-
-            Panel detailsPanel = new Panel
-            {
-                Location = new System.Drawing.Point(15, 25),
-                Size = new System.Drawing.Size(630, 245),
-                AutoScroll = true,
-                BorderStyle = BorderStyle.FixedSingle
-            };
-
-            // Build structured HTML-like formatted text
-            int detailY = 10;
-            foreach (int i in Enumerable.Range(0, videoFiles.Count).Where(idx => idx < cameras.Count))
-            {
-                string videoFile = videoFiles[i];
-                
-                if (!File.Exists(videoFile))
-                    continue;
-                
-                try
-                {
-                    // Get frame count from file
-                    int actualFrames = GetVideoFrameCount(videoFile);
-                    
-                    // Get stored metadata (just for reference, not for calculation)
-                    double storedFps = GetVideoFrameRate(videoFile);
-                    double aviMetadataDuration = GetVideoDuration(videoFile);  // Just for display
-                    
-                    // CRITICAL: Use THIS CAMERA's actual recording duration
-                    double actualRecordingDuration = actualCameraDurations.ContainsKey(i) ? actualCameraDurations[i] : testDuration;
-
-                    // Calculate FPS from actual recording time
-                    double calculatedFps = actualRecordingDuration > 0 ? actualFrames / actualRecordingDuration : 0;
-
-                    double expectedFps = cameraExpectedFps[i];
-                    // Calculate expected frames based on THIS camera's actual recording time
-                    int expectedFrames = (int)(actualRecordingDuration * expectedFps);
-                    
-                    double fpsAccuracy = expectedFps > 0 ? (calculatedFps / expectedFps) * 100 : 0;
-                    int frameDifference = actualFrames - expectedFrames;
-                    double frameAccuracy = expectedFrames > 0 ? (actualFrames / (double)expectedFrames) * 100 : 0;
-                    
-                    string verdict = "";
-                    System.Drawing.Color verdictColor;
-                    if (frameAccuracy >= 99 && Math.Abs(fpsAccuracy - 100) < 5)
-                    {
-                        verdict = "✅ EXCELLENT";
-                        verdictColor = System.Drawing.Color.Green;
-                    }
-                    else if (frameAccuracy >= 95 && Math.Abs(fpsAccuracy - 100) < 10)
-                    {
-                        verdict = "✅ GOOD";
-                        verdictColor = System.Drawing.Color.Green;
-                    }
-                    else if (frameAccuracy >= 90)
-                    {
-                        verdict = "⚠️ ACCEPTABLE";
-                        verdictColor = System.Drawing.Color.Orange;
-                    }
-                    else
-                    {
-                        verdict = "❌ POOR";
-                        verdictColor = System.Drawing.Color.Red;
-                    }
-                    
-                    // Camera header
-                    Label lblCameraHeader = new Label
-                    {
-                        Text = $"{verdict} - {cameras[i].CustomName}",
-                        Location = new System.Drawing.Point(10, detailY),
-                        Size = new System.Drawing.Size(600, 25),  // ← INCREASED to 600
-                        Font = new System.Drawing.Font("Arial", 10, System.Drawing.FontStyle.Bold),
-                        ForeColor = verdictColor,
-                        BackColor = System.Drawing.Color.FromArgb(240, 240, 240)
-                    };
-
-                    detailsPanel.Controls.Add(lblCameraHeader);
-                    detailY += 30;
-                    
-                    // Expected values
-                    Label lblExpected = new Label
-                    {
-                        Text = $"Expected:  {expectedFrames:N0} frames @ {expectedFps:F1} fps",
-                        Location = new System.Drawing.Point(25, detailY),
-                        Size = new System.Drawing.Size(590, 20),  // ← INCREASED to 590
-                        Font = new System.Drawing.Font("Consolas", 9)
-                    };
-                    detailsPanel.Controls.Add(lblExpected);
-                    detailY += 22;
-
-                    // Actual values - USE ACTUAL RECORDING TIME
-                    Label lblActual = new Label
-                    {
-                        Text = $"Actual:    {actualFrames:N0} frames in {actualRecordingDuration:F2}s = {calculatedFps:F2} fps",
-                        Location = new System.Drawing.Point(25, detailY),
-                        Size = new System.Drawing.Size(590, 20),  // ← INCREASED to 590
-                        Font = new System.Drawing.Font("Consolas", 9),
-                        ForeColor = frameAccuracy >= 95 ? System.Drawing.Color.Green : System.Drawing.Color.Red
-                    };
-                    detailsPanel.Controls.Add(lblActual);
-                    detailY += 22;
-
-                    // Accuracy metrics
-                    string accuracyText = $"Frame Accuracy: {frameAccuracy:F1}% ({frameDifference:+0;-0} frames)  |  " +
-                                        $"FPS Accuracy: {fpsAccuracy:F1}%";
-                    Label lblAccuracy = new Label
-                    {
-                        Text = accuracyText,
-                        Location = new System.Drawing.Point(25, detailY),
-                        Size = new System.Drawing.Size(590, 20),  // ← INCREASED to 590
-                        Font = new System.Drawing.Font("Arial", 8),
-                        ForeColor = System.Drawing.Color.Gray
-                    };
-                    detailsPanel.Controls.Add(lblAccuracy);
-                    detailY += 22;
-
-                    // File info - show BOTH durations for comparison
-                    Label lblFile = new Label
-                    {
-                        Text = $"Recording: {actualRecordingDuration:F2}s  |  AVI metadata: {aviMetadataDuration:F2}s (stored: {storedFps:F1} fps)\nFile: {Path.GetFileName(videoFile)}",
-                        Location = new System.Drawing.Point(25, detailY),
-                        Size = new System.Drawing.Size(590, 35),  // ← INCREASED to 590
-                        Font = new System.Drawing.Font("Arial", 7),
-                        ForeColor = System.Drawing.Color.DarkBlue
-                    };
-                    detailsPanel.Controls.Add(lblFile);
-                    detailY += 40;
-                }
-                catch (Exception ex)
-                {
-                    Label lblError = new Label
-                    {
-                        Text = $"❌ {cameras[i].CustomName}: ERROR - {ex.Message}",
-                        Location = new System.Drawing.Point(10, detailY),
-                        Size = new System.Drawing.Size(590, 40),
-                        Font = new System.Drawing.Font("Arial", 9),
-                        ForeColor = System.Drawing.Color.Red
-                    };
-                    detailsPanel.Controls.Add(lblError);
-                    detailY += 45;
-                }
-            }
-
-
-            grpDetails.Controls.Add(detailsPanel);
-            resultsForm.Controls.Add(grpDetails);
-            y += 290;
-
-            // Close button
-            Button btnClose = new Button
-            {
-                Text = "Close",
-                Location = new System.Drawing.Point(290, y),
-                Size = new System.Drawing.Size(100, 35),
-                DialogResult = DialogResult.OK,
-                Font = new System.Drawing.Font("Arial", 10)
-            };
-            resultsForm.Controls.Add(btnClose);
-            resultsForm.AcceptButton = btnClose;
-
-            LogCameraInfo($"=== VIDEO TEST RESULTS ===");
-            LogCameraInfo($"Analyzed: {analyzedCount}/{cameras.Count} cameras");
-
-            resultsForm.ShowDialog();
-        }
-
         private void ManageCameraProfiles()
         {
             Form profileForm = new Form
@@ -4167,7 +2530,6 @@ namespace QueenPix
                         if (cameraIndex < cameras.Count)  // Use the existing cameraIndex variable
                         {
                             cameras[cameraIndex].FrameCount++;
-                            RecordFrameTiming(cameras[cameraIndex]);
                             // Debug: Log first 5 frames to verify event is firing
                             if (cameras[cameraIndex].FrameCount <= 5)
                             {
@@ -5112,7 +3474,6 @@ namespace QueenPix
                         if (cameraIndex < cameras.Count)
                         {
                             cameras[cameraIndex].FrameCount++;
-                            RecordFrameTiming(cameras[cameraIndex]);
                         }
                     };
                     
@@ -5872,10 +4233,9 @@ namespace QueenPix
                             camera.FpsLabel.Text = $"⏱️ TIMELAPSE | {camera.TimelapseFrameCount} frames | Next in {nextCaptureSeconds}s";
                             camera.FpsLabel.ForeColor = System.Drawing.Color.Purple;
                         }
-                        else if (cmbRecordingMode.SelectedItem?.ToString() == "Loop Recording" && camera.LoopBuffer != null)
+                        else if (camera.QueuedRecorder != null && camera.QueuedRecorder.IsLoop)
                         {
-                            int bufferFrames = 0;
-                            lock (camera.LoopBufferLock) { bufferFrames = camera.LoopBuffer.Count; }
+                            int bufferFrames = camera.QueuedRecorder.QueueDepth;
 
                             double expectedFps = camera.Settings.UseExternalTrigger
                                 ? (double)numExternalTriggerFps.Value
@@ -6648,6 +5008,39 @@ namespace QueenPix
                             continue;
                         }
 
+                        if (camera.QueuedRecorder != null)
+                        {
+                            // Recording: the frame comes from the recorder (its sink keeps no image)
+                            int camNo = cameras.IndexOf(camera) + 1;
+                            using (var shot = camera.QueuedRecorder.TakeSnapshot())
+                            {
+                                if (shot == null)
+                                {
+                                    errors.Add($"Camera {camNo}: no frame from the recording within 1 s (trigger off?)");
+                                    continue;
+                                }
+                                string shotName = string.IsNullOrWhiteSpace(camera.CustomName)
+                                    ? $"Camera{camNo}" : camera.CustomName.Replace(" ", "_");
+                                string shotPath = Path.Combine(screenshotsFolder, $"{timestamp}_{shotName}.png");
+                                if (showSaveDialog)
+                                {
+                                    using (SaveFileDialog saveDialog = new SaveFileDialog())
+                                    {
+                                        saveDialog.Filter = "PNG Image|*.png|All Files|*.*";
+                                        saveDialog.FileName = Path.GetFileName(shotPath);
+                                        saveDialog.InitialDirectory = screenshotsFolder;
+                                        saveDialog.Title = $"Save Screenshot - {shotName}";
+                                        if (saveDialog.ShowDialog(this) != DialogResult.OK)
+                                            continue;
+                                        shotPath = saveDialog.FileName;
+                                    }
+                                }
+                                shot.Save(shotPath, System.Drawing.Imaging.ImageFormat.Png);
+                                savedCount++;
+                            }
+                            continue;
+                        }
+
                         if (camera.ImagingControl.LiveVideoRunning)
                         {
                             ImageBuffer? imageBuffer = null;
@@ -6657,8 +5050,8 @@ namespace QueenPix
                             {
                                 imageBuffer = frameHandlerSink.LastAcquiredBuffer;
                             }
-                            // Method 2: normal recording — active sink is MediaStreamSink; try the
-                            // FrameHandlerSink that was active during live preview (stored in OriginalSink).
+                            // Method 2: try the FrameHandlerSink that was active during live preview
+                            // (stored in OriginalSink).
                             // Its LastAcquiredBuffer may be null if the SDK released it on LiveStop().
                             else if (camera.OriginalSink is FrameHandlerSink originalFrameHandlerSink)
                             {
@@ -6889,9 +5282,7 @@ namespace QueenPix
                             }
                             
                             camera.MaxLoopFrames = (int)(loopDurationSeconds * expectedFps);
-                            // ✅ Pre-allocate capacity to avoid resizing
-                            camera.LoopBuffer = new Queue<System.Drawing.Bitmap>(camera.MaxLoopFrames + 10);
-                            LogCameraInfo($"{camera.CustomName}: Loop buffer initialized for {camera.MaxLoopFrames} frames ({expectedFps:F1} fps)");
+                            LogCameraInfo($"{camera.CustomName}: loop keeps {camera.MaxLoopFrames} frames ({expectedFps:F1} fps)");
                         }
                     }
                     catch { }
@@ -6939,104 +5330,27 @@ namespace QueenPix
                         }
 
                         camera.OriginalSink = camera.ImagingControl.Sink;
+                        camera.QueuedRecorder = null;
 
                         if (isLoopMode)
                         {
-                            // Loop mode - use FrameHandlerSink in grab mode
-                            var frameHandlerSink = new FrameHandlerSink();
-                            frameHandlerSink.SnapMode = false; // Grab mode (continuous capture)
-                            camera.ImagingControl.Sink = frameHandlerSink;
-                            camera.RecordingFilePath = null;
-                            
-                            // Start background polling thread
-                            camera.LoopCancelToken = new CancellationTokenSource();
-                            camera.LastFrameNumber = -1;
-                            
-                            int cameraIndex = i;
-                            camera.LoopCaptureTask = Task.Run(() => 
-                            {
-                                LogCameraInfo($"{cameras[cameraIndex].CustomName}: Loop capture thread started");
-                                
-                                while (!camera.LoopCancelToken.Token.IsCancellationRequested)
-                                {
-                                    try
-                                    {
-                                        var sink = cameras[cameraIndex].ImagingControl.Sink as FrameHandlerSink;
-                                        if (sink == null) continue;
-                                        
-                                        // Check if a new frame arrived using FrameCount
-                                        long currentFrameCount = sink.FrameCount;
-                                        if (currentFrameCount != cameras[cameraIndex].LastFrameNumber)
-                                        {
-                                            // ✅ Check for dropped frames
-                                            if (cameras[cameraIndex].LastFrameNumber >= 0)
-                                            {
-                                                long frameDelta = currentFrameCount - cameras[cameraIndex].LastFrameNumber;
-                                                if (frameDelta > 1)
-                                                {
-                                                    cameras[cameraIndex].DroppedFrames += (int)(frameDelta - 1);
-                                                    if (cameras[cameraIndex].DroppedFrames <= 10 || cameras[cameraIndex].DroppedFrames % 50 == 0)
-                                                    {
-                                                        LogCameraInfo($"⚠️ {cameras[cameraIndex].CustomName}: Dropped {frameDelta - 1} frames! Total dropped: {cameras[cameraIndex].DroppedFrames}");
-                                                    }
-                                                }
-                                            }
-                                            
-                                            cameras[cameraIndex].ExpectedFrameCount++;
-                                            cameras[cameraIndex].LastFrameNumber = currentFrameCount;
-                                            
-                                            // Get the frame from LastAcquiredBuffer (NOT ImageActiveBuffer!)
-                                            var imageBuffer = sink.LastAcquiredBuffer;
-                                            var bitmap = imageBuffer?.Bitmap;
-                                            
-                                            if (bitmap != null)
-                                            {
-                                                lock (cameras[cameraIndex].LoopBufferLock)
-                                                {
-                                                    // DEEP clone bitmap with complete memory independence
-                                                    System.Drawing.Bitmap clonedFrame = DeepCloneBitmap(bitmap);
-                                                    
-                                                    // Apply date/time overlay if enabled
-                                                    if (cameras[cameraIndex].Settings.ShowDate || cameras[cameraIndex].Settings.ShowTime)
-                                                    {
-                                                        System.Drawing.Bitmap overlayFrame = ApplyDateTimeOverlay(clonedFrame, cameras[cameraIndex].Settings, DateTime.Now);
-                                                        clonedFrame.Dispose(); // Dispose original
-                                                        clonedFrame = overlayFrame;
-                                                    }
-                                                    
-                                                    // Add to buffer
-                                                    cameras[cameraIndex].LoopBuffer!.Enqueue(clonedFrame);
-                                                    
-                                                    // Log progress
-                                                    if (cameras[cameraIndex].LoopBuffer.Count <= 5 || 
-                                                        cameras[cameraIndex].LoopBuffer.Count % 100 == 0)
-                                                    {
-                                                        LogCameraInfo($"Loop: {cameras[cameraIndex].CustomName} buffer = {cameras[cameraIndex].LoopBuffer.Count} frames (total captured: {currentFrameCount})");
-                                                    }
-                                                    
-                                                    // Remove oldest if over limit
-                                                    if (cameras[cameraIndex].LoopBuffer.Count > cameras[cameraIndex].MaxLoopFrames)
-                                                    {
-                                                        var oldFrame = cameras[cameraIndex].LoopBuffer.Dequeue();
-                                                        oldFrame.Dispose();
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    catch (Exception ex)
-                                    {
-                                        LogCameraInfo($"Loop polling error for {cameras[cameraIndex].CustomName}: {ex.Message}");
-                                    }
-                                    
-                                    // Poll every 5ms (fast enough for 200fps)
-                                    Thread.Sleep(5);
-                                }
-                                
-                                LogCameraInfo($"{cameras[cameraIndex].CustomName}: Loop capture thread stopped");
-                            }, camera.LoopCancelToken.Token);
-                            
-                            LogCameraInfo($"Camera {i + 1} loop mode - polling thread with FrameHandlerSink started");
+                            // Loop mode: same queued recorder as normal recordings, but it keeps only
+                            // the last MaxLoopFrames frames in RAM and writes them when recording stops.
+                            string loopFolder = Path.Combine(Path.GetTempPath(), $"LoopRecording_{currentRecordingBaseName}");
+                            Directory.CreateDirectory(loopFolder);
+                            string loopName = string.Join("_", camera.CustomName.Split(Path.GetInvalidFileNameChars())).Replace(" ", "_");
+                            if (string.IsNullOrWhiteSpace(loopName))
+                                loopName = $"Camera{i + 1}";
+                            string loopFile = Path.Combine(loopFolder, $"{currentRecordingBaseName}_{loopName}.avi");
+                            double loopFps = camera.Settings?.UseExternalTrigger == true
+                                ? (double)numExternalTriggerFps.Value
+                                : camera.Settings?.SoftwareFrameRate ?? 0;
+                            var loopRecorder = new QueuedAviRecorder(loopFile, $"Camera {i + 1}",
+                                camera.ImagingControl.ImageWidth, camera.ImagingControl.ImageHeight,
+                                loopFps, 0, LogCameraInfo, Math.Max(10, camera.MaxLoopFrames));
+                            camera.QueuedRecorder = loopRecorder;
+                            camera.ImagingControl.Sink = loopRecorder.Sink;
+                            camera.RecordingFilePath = loopFile;
                         }
                         else if (isTimelapseMode)
                         {
@@ -7086,7 +5400,7 @@ namespace QueenPix
                                 }
                             }
                             
-                            // All formats: Use MediaStreamSink (preserves quality)
+                            // Uncompressed Y800 AVI via the queued recorder (frames never wait for the disk).
                             // Overlay will be applied during conversion/trimming using FFmpeg
                             string safeName = string.Join("_", camera.CustomName.Split(Path.GetInvalidFileNameChars()));
                             if (string.IsNullOrWhiteSpace(safeName))
@@ -7096,26 +5410,14 @@ namespace QueenPix
                                 $"{currentRecordingBaseName}_{safeName}.avi");
                             
                             camera.RecordingFilePath = aviFilename;
-                            camera.QueuedRecorder = null;
-                            if (_useBufferedRecording)
-                            {
-                                double headerFps = camera.Settings?.UseExternalTrigger == true
-                                    ? (double)numExternalTriggerFps.Value
-                                    : camera.Settings?.SoftwareFrameRate ?? 0;
-                                var recorder = new QueuedAviRecorder(aviFilename, $"Camera {i + 1}",
-                                    camera.ImagingControl.ImageWidth, camera.ImagingControl.ImageHeight,
-                                    headerFps, RecordBufferMBPerCamera, LogCameraInfo);
-                                camera.QueuedRecorder = recorder;
-                                camera.ImagingControl.Sink = recorder.Sink;
-                            }
-                            else
-                            {
-                                camera.ImagingControl.Sink = new MediaStreamSink((AviCompressor?)null, aviFilename);
-                            }
-                            camera.RecFrameEvents = 0;
-                            camera.RecTimingActive = true;   // time every frame from now until LiveStop
-                            if (camera.QueuedRecorder == null)
-                                StartFileGrowthTiming(camera, aviFilename);
+                            double headerFps = camera.Settings?.UseExternalTrigger == true
+                                ? (double)numExternalTriggerFps.Value
+                                : camera.Settings?.SoftwareFrameRate ?? 0;
+                            var recorder = new QueuedAviRecorder(aviFilename, $"Camera {i + 1}",
+                                camera.ImagingControl.ImageWidth, camera.ImagingControl.ImageHeight,
+                                headerFps, RecordBufferMBPerCamera, LogCameraInfo);
+                            camera.QueuedRecorder = recorder;
+                            camera.ImagingControl.Sink = recorder.Sink;
                             
                             LogCameraInfo($"Camera {i + 1} recording mode configured: {aviFilename}");
                         }
@@ -7135,7 +5437,7 @@ namespace QueenPix
                     {
                         if (camera.IsImagingSource)
                         {
-                            if (!isLoopMode && !isTimelapseMode)
+                            if (!isTimelapseMode)
                             {
                                 // The SDK's live display makes the cameras stall one after another when
                                 // triggering starts (6 Nov 2026), so it is always off while recording.
@@ -7707,14 +6009,18 @@ namespace QueenPix
                         // LOOP MODE: CRITICAL - Stop cameras FIRST to freeze the buffer!
                         LogCameraInfo("Loop mode - stopping cameras immediately to freeze buffer");
 
-                        // STEP 1: Stop target TIS cameras IMMEDIATELY (webcams don't use loop mode)
-                        foreach (var camera in targets)
+                        // Stop the cameras first so the loop buffers stop changing
+                        for (int i = 0; i < targets.Count; i++)
                         {
+                            var camera = targets[i];
                             try
                             {
                                 camera.RecordingStopTime = DateTime.Now;
                                 if (camera.IsImagingSource)
+                                {
+                                    LogFrameDropCounters(camera, i + 1);   // must be read BEFORE LiveStop
                                     camera.ImagingControl.LiveStop();
+                                }
                                 LogCameraInfo($"{camera.CustomName}: Camera stopped at {camera.RecordingStopTime.Value:HH:mm:ss.fff}");
                             }
                             catch (Exception ex)
@@ -7723,104 +6029,35 @@ namespace QueenPix
                             }
                         }
 
-                        // STEP 2: Give a tiny moment for any in-flight frames to finish processing
-                        System.Threading.Thread.Sleep(100);
-
-                        // STEP 3: Now stop the polling threads (they won't add any more frames)
-                        LogCameraInfo("Loop mode - stopping polling threads");
-                        foreach (var camera in targets)
-                        {
-                            if (camera.LoopCancelToken != null)
-                            {
-                                camera.LoopCancelToken.Cancel();
-                                camera.LoopCaptureTask?.Wait(1000); // Wait up to 1 second
-                                
-                                // ✅ Dispose properly
-                                camera.LoopCancelToken.Dispose();
-                                camera.LoopCancelToken = null;
-                                camera.LoopCaptureTask = null;
-                                
-                                LogCameraInfo($"{camera.CustomName}: Polling thread stopped and disposed");
-                            }
-                        }
-                        
-                        // STEP 4: Buffers are now frozen - save them to temporary AVI files
-                        LogCameraInfo("Loop mode - saving buffered frames to temp files");
-                        
-                        string tempFolder = Path.Combine(Path.GetTempPath(), $"LoopRecording_{DateTime.Now:yyyyMMddHHmmss}");
-                        Directory.CreateDirectory(tempFolder);
-                        
+                        // Write each loop buffer (oldest frame first) to its temporary AVI
                         for (int i = 0; i < targets.Count; i++)
                         {
                             var camera = targets[i];
                             try
                             {
-                                // Save loop buffer to AVI file
-                                if (camera.LoopBuffer != null && camera.LoopBuffer.Count > 0)
+                                var loopRecorder = camera.QueuedRecorder;
+                                if (loopRecorder != null)
                                 {
-                                    // Sanitize camera name - remove invalid chars AND spaces
-                                    string safeName = string.Join("_", camera.CustomName.Split(Path.GetInvalidFileNameChars()));
-                                    safeName = safeName.Replace(" ", "_"); // Remove spaces
-                                    if (string.IsNullOrWhiteSpace(safeName))
-                                        safeName = $"Camera{i + 1}";
-                                    
-                                    string tempAviFile = Path.Combine(tempFolder, $"{currentRecordingBaseName}_{safeName}.avi");
-                                    
-                                    LogCameraInfo($"{camera.CustomName}: Saving {camera.LoopBuffer.Count} frames from frozen buffer");
-                                    
-                                    // CRITICAL: Create deep clones of bitmaps so we can dispose originals safely
-                                    List<System.Drawing.Bitmap> clonedFrames = new List<System.Drawing.Bitmap>();
-                                    
-                                    lock (camera.LoopBufferLock)
-                                    {
-                                        foreach (var frame in camera.LoopBuffer)
-                                        {
-                                            // Deep clone each bitmap
-                                            clonedFrames.Add((System.Drawing.Bitmap)frame.Clone());
-                                        }
-                                    }
-                                    
-                                    LogCameraInfo($"{camera.CustomName}: Cloned {clonedFrames.Count} frames for saving");
-                                    
-                                    // Save the cloned frames (this can take time without blocking the original buffer)
-                                    SaveLoopBufferToAvi(clonedFrames, tempAviFile, camera);
-                                    
-                                    // Now dispose the clones after saving is complete
-                                    foreach (var clonedFrame in clonedFrames)
-                                    {
-                                        clonedFrame.Dispose();
-                                    }
-                                    clonedFrames.Clear();
-                                    
-                                    aviFiles.Add(tempAviFile);
-                                    LogCameraInfo($"{camera.CustomName}: Saved and cleaned up {camera.LoopBuffer.Count} buffered frames");
+                                    RemoveRecordingPreview(camera);
+                                    loopRecorder.Finish();
+                                    if (loopRecorder.FramesLost > 0)
+                                        camera.DroppedFrames = Math.Max(0, camera.DroppedFrames) + (int)loopRecorder.FramesLost;
+                                    if (loopRecorder.OldestKeptTime.HasValue)
+                                        camera.RecordingStartTime = loopRecorder.OldestKeptTime;   // overlay time = first saved frame
+                                    if (camera.RecordingFilePath != null && File.Exists(camera.RecordingFilePath))
+                                        aviFiles.Add(camera.RecordingFilePath);
+                                    else
+                                        LogCameraInfo($"{camera.CustomName}: loop buffer was empty - no frames to save");
                                 }
-                                else
-                                {
-                                    LogCameraInfo($"{camera.CustomName}: Buffer was empty or null - no frames to save");
-                                }
-                                
-                                // NOW it's safe to clear the original buffer and restore camera
-                                lock (camera.LoopBufferLock)
-                                {
-                                    if (camera.LoopBuffer != null)
-                                    {
-                                        while (camera.LoopBuffer.Count > 0)
-                                        {
-                                            var frame = camera.LoopBuffer.Dequeue();
-                                            frame.Dispose();
-                                        }
-                                        camera.LoopBuffer = null;
-                                    }
-                                }
-                                
-                                // Restore original sink and restart live (TIS only)
+
                                 if (camera.IsImagingSource)
                                 {
                                     camera.ImagingControl.Sink = camera.OriginalSink;
+                                    loopRecorder?.DisposeSink();
+                                    camera.ImagingControl.LiveDisplay = true;   // preview back on after recording
                                     camera.ImagingControl.LiveStart();
                                 }
-                                
+
                                 successCount++;
                             }
                             catch (Exception ex)
@@ -7845,7 +6082,6 @@ namespace QueenPix
                                 {
                                     LogFrameDropCounters(camera, i + 1);   // must be read BEFORE LiveStop
                                     camera.ImagingControl.LiveStop();
-                                    camera.RecTimingActive = false;
                                     if (camera.QueuedRecorder != null)
                                     {
                                         RemoveRecordingPreview(camera);
@@ -7959,6 +6195,13 @@ namespace QueenPix
                                     expectedFps = camera.Settings.SoftwareFrameRate;
                                 }
                                 actualDuration = frameCount / expectedFps;
+
+                                if (camera.QueuedRecorder != null)
+                                {
+                                    long missed = camera.QueuedRecorder.LogTimeline($"Camera {i + 1}");
+                                    if (missed > 0)   // ignored triggers: invisible to the SDK counters
+                                        camera.DroppedFrames = Math.Max(0, camera.DroppedFrames) + (int)missed;
+                                }
                             }
                             else
                             {
@@ -7973,11 +6216,7 @@ namespace QueenPix
                                 // Prefer the REAL frame rate measured from frame arrival times. The Start/Stop
                                 // button times include the camera/file start-up delay and idle time before the
                                 // trigger is switched on, which made the reported fps too low.
-                                long aviBytes = 0;
-                                try { aviBytes = new FileInfo(aviFile).Length; } catch { }
-                                double measuredFps = camera.QueuedRecorder != null
-                                    ? camera.QueuedRecorder.MeasuredFps()
-                                    : MeasuredRecordingFps(camera, frameCount, aviBytes);
+                                double measuredFps = camera.QueuedRecorder?.MeasuredFps() ?? 0;
                                 if (measuredFps > 0)
                                 {
                                     LogCameraInfo($"Camera {i + 1}: measured frame rate {measuredFps:F2} fps " +
@@ -7994,8 +6233,6 @@ namespace QueenPix
                                     if (missed > 0)   // ignored triggers: invisible to the SDK counters
                                         camera.DroppedFrames = Math.Max(0, camera.DroppedFrames) + (int)missed;
                                 }
-                                else
-                                    LogFileGrowthTimeline(camera, i + 1, frameCount, aviBytes);
                             }
                             
                             double aviDuration = GetVideoDuration(aviFile);
@@ -8100,148 +6337,6 @@ namespace QueenPix
                 LogCameraInfo($"Stop recording ERROR: {ex.Message}");
             }
         }
-        private void SaveLoopBufferToAvi(List<System.Drawing.Bitmap> frames, string outputPath, CameraControl camera)
-        {
-            if (frames.Count == 0) return;
-            
-            try
-            {
-                // Get frame dimensions and format from first frame
-                int width = frames[0].Width;
-                int height = frames[0].Height;
-                bool isColor = frames[0].PixelFormat != System.Drawing.Imaging.PixelFormat.Format8bppIndexed;
-                
-                LogCameraInfo($"Saving {frames.Count} frames to {outputPath}");
-                LogCameraInfo($"  Format: {width}x{height}, Color: {isColor}, PixelFormat: {frames[0].PixelFormat}");
-                
-                // Calculate FPS
-                double fps;
-                if (camera.Settings.UseExternalTrigger)
-                {
-                    fps = (double)numExternalTriggerFps.Value;
-                    LogCameraInfo($"  Using External Trigger FPS: {fps} fps (from numExternalTriggerFps control)");
-                }
-                else
-                {
-                    fps = camera.Settings.SoftwareFrameRate;
-                    LogCameraInfo($"  Using Software Frame Rate: {fps} fps (from camera settings)");
-                }
-                
-                LogCameraInfo($"  Saving {frames.Count} frames at {fps} fps");
-                
-                // Use OpenCvSharp to write frames to AVI
-                using (var writer = new OpenCvSharp.VideoWriter())
-                {
-                    // Try uncompressed codecs first for best quality (matching MediaStreamSink with null compressor)
-                    // DIB = Device Independent Bitmap (uncompressed RGB) - matches MediaStreamSink behavior
-                    // Y800 = uncompressed grayscale
-                    int fourcc;
-                    string codecName;
-                    if (isColor)
-                    {
-                        // For color: Try DIB (uncompressed RGB) first, fallback to MJPG if not available
-                        fourcc = OpenCvSharp.FourCC.FromString("DIB ");
-                        codecName = "DIB (uncompressed RGB)";
-                    }
-                    else
-                    {
-                        // For grayscale: Use Y800 (uncompressed grayscale) or DIB
-                        fourcc = OpenCvSharp.FourCC.FromString("Y800");
-                        codecName = "Y800 (uncompressed grayscale)";
-                    }
-                    
-                    // Open video writer with correct color flag
-                    bool opened = writer.Open(outputPath, fourcc, fps, new OpenCvSharp.Size(width, height), isColor);
-                    
-                    // Fallback to MJPG if uncompressed codec fails (lossy but widely supported)
-                    if (!opened)
-                    {
-                        LogCameraInfo($"Uncompressed codec not available, trying MJPG (lossy compression)");
-                        fourcc = OpenCvSharp.FourCC.MJPG;
-                        codecName = "MJPG (lossy)";
-                        opened = writer.Open(outputPath, fourcc, fps, new OpenCvSharp.Size(width, height), isColor);
-                    }
-                    
-                    if (!opened)
-                    {
-                        LogCameraInfo($"ERROR: Could not open video writer for {outputPath}");
-                        LogCameraInfo($"  Tried: Uncompressed and MJPG codecs, {width}x{height}, {fps} fps, isColor={isColor}");
-                        return;
-                    }
-                    
-                    LogCameraInfo($"Video writer opened successfully with codec: {codecName}");
-                    
-                    // Write all frames
-                    int frameCount = 0;
-                    foreach (var bitmap in frames)
-                    {
-                        try
-                        {
-                            // Convert bitmap to Mat
-                            using (var mat = OpenCvSharp.Extensions.BitmapConverter.ToMat(bitmap))
-                            {
-                                // If grayscale but Mat has 3 channels, convert to single channel
-                                if (!isColor && mat.Channels() == 3)
-                                {
-                                    using (var grayMat = new OpenCvSharp.Mat())
-                                    {
-                                        OpenCvSharp.Cv2.CvtColor(mat, grayMat, OpenCvSharp.ColorConversionCodes.BGR2GRAY);
-                                        writer.Write(grayMat);
-                                    }
-                                }
-                                // If color but Mat has 1 channel, convert to 3 channels
-                                else if (isColor && mat.Channels() == 1)
-                                {
-                                    using (var colorMat = new OpenCvSharp.Mat())
-                                    {
-                                        OpenCvSharp.Cv2.CvtColor(mat, colorMat, OpenCvSharp.ColorConversionCodes.GRAY2BGR);
-                                        writer.Write(colorMat);
-                                    }
-                                }
-                                else
-                                {
-                                    // Channels match, write directly
-                                    writer.Write(mat);
-                                }
-                                
-                                frameCount++;
-                                
-                                // Log progress every 100 frames
-                                if (frameCount % 100 == 0)
-                                {
-                                    LogCameraInfo($"  Wrote {frameCount}/{frames.Count} frames");
-                                }
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            LogCameraInfo($"ERROR writing frame {frameCount}: {ex.Message}");
-                        }
-                    }
-                    
-                    writer.Release();
-                    LogCameraInfo($"Successfully saved {frameCount} frames to {outputPath}");
-                }
-                
-                // Verify the file was created and has data
-                if (File.Exists(outputPath))
-                {
-                    FileInfo fileInfo = new FileInfo(outputPath);
-                    LogCameraInfo($"  Output file size: {fileInfo.Length / (1024 * 1024)} MB");
-                }
-                else
-                {
-                    LogCameraInfo($"ERROR: Output file was not created!");
-                }
-            }
-            catch (Exception ex)
-            {
-                LogCameraInfo($"ERROR saving loop buffer to AVI: {ex.Message}");
-                LogCameraInfo($"  Stack trace: {ex.StackTrace}");
-                throw;
-            }
-        }
-
         private void ProcessRecordingOutput(List<string> aviFiles, string outputPath, string outputFilename, 
                                             double fps, FrameSelectionDialog.OutputFormat format)
         {
@@ -10636,32 +8731,6 @@ namespace QueenPix
             }
         }
 
-        // Called for every frame (ImageAvailable). Records the arrival time of the first and the
-        // latest frame while a recording is running.
-        private static void RecordFrameTiming(CameraControl cam)
-        {
-            if (!cam.RecTimingActive) return;
-            long t = Stopwatch.GetTimestamp();
-            if (cam.RecFrameEvents == 0) cam.RecFirstFrameTicks = t;
-            cam.RecLastFrameTicks = t;
-            cam.RecFrameEvents++;
-        }
-
-        // True frame rate of the last recording, from frame arrival times (0 if not available).
-        // Uses the frames between the first and last frame, so start-up delay and idle time
-        // (e.g. trigger switched on after Start Recording) do not count.
-        private static double MeasuredRecordingFps(CameraControl cam, int framesInFile, long fileBytes)
-        {
-            long events = cam.RecFrameEvents;
-            if (events < 10) return MeasuredFpsFromFileGrowth(cam, framesInFile, fileBytes);
-            double seconds = (cam.RecLastFrameTicks - cam.RecFirstFrameTicks) / (double)Stopwatch.Frequency;
-            if (seconds <= 0) return 0;
-            // If (nearly) every frame raised an event, count the events themselves; otherwise use
-            // the number of frames in the file over the same first-to-last span.
-            long frames = (framesInFile > 0 && events < 0.9 * framesInFile) ? framesInFile : events;
-            return (frames - 1) / seconds;
-        }
-
         // Puts a camera into external-trigger mode (external = true) or free-running mode.
         // External: trigger OFF -> re-apply the video format (the driver builds its frame-rate list
         // when the format is set, and builds a reduced list - max 90 fps here - if the trigger is on
@@ -10855,92 +8924,14 @@ namespace QueenPix
             return null;
         }
 
-        // Samples the size of the recording file every ~10 ms while recording. Each frame adds a
-        // fixed number of bytes, so the growth over time gives the true frame rate.
-        private static void StartFileGrowthTiming(CameraControl cam, string path)
+        private void UpdateRecordToggle()
         {
-            lock (cam.RecFileSamplesLock) cam.RecFileSamples.Clear();
-            System.Threading.Tasks.Task.Run(async () =>
-            {
-                long lastLen = -1;
-                while (cam.RecTimingActive)
-                {
-                    try
-                    {
-                        using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read,
-                                                       FileShare.ReadWrite | FileShare.Delete))
-                        {
-                            long len = fs.Length;
-                            if (len != lastLen)
-                            {
-                                lastLen = len;
-                                long t = Stopwatch.GetTimestamp();
-                                lock (cam.RecFileSamplesLock) cam.RecFileSamples.Add((t, len));
-                            }
-                        }
-                    }
-                    catch { /* file not created yet */ }
-                    await System.Threading.Tasks.Task.Delay(10);
-                }
-            });
-        }
-
-        // True fps from how fast the recording file grows while recording (see below).
-        private static double MeasuredFpsFromFileGrowth(CameraControl cam, int frames, long fileBytes)
-        {
-            // The file grows only while frames arrive. Split the recording into "runs" of continuous
-            // growth (a pause = trigger switched off), fit the steady-state slope of file size vs time
-            // inside each run (inner 10-90 %, so the start-up burst and the flush at stop are left out),
-            // and combine the runs weighted by their frame count. Pauses therefore do not lower the
-            // result, however many times the trigger is switched on and off.
-            List<(long ticks, long bytes)> s;
-            lock (cam.RecFileSamplesLock) s = new List<(long ticks, long bytes)>(cam.RecFileSamples);
-            if (frames < 10 || fileBytes <= 0 || s.Count < 10) return 0;
-            double bpf = fileBytes / (double)frames;     // header + index add < 0.1 %
-            double f = Stopwatch.Frequency;
-
-            // typical time between growth events -> pause threshold
-            var dts = new List<double>();
-            for (int k = 1; k < s.Count; k++) dts.Add((s[k].ticks - s[k - 1].ticks) / f);
-            dts.Sort();
-            double medDt = dts[dts.Count / 2];
-            double gap = Math.Max(0.25, 8 * medDt);
-
-            var runs = new List<List<(long ticks, long bytes)>>();
-            var cur = new List<(long ticks, long bytes)> { s[0] };
-            for (int k = 1; k < s.Count; k++)
-            {
-                if ((s[k].ticks - s[k - 1].ticks) / f > gap) { runs.Add(cur); cur = new List<(long ticks, long bytes)>(); }
-                cur.Add(s[k]);
-            }
-            runs.Add(cur);
-
-            double wSum = 0, rSum = 0;
-            foreach (var run in runs)
-            {
-                if (run.Count < 6) continue;
-                long b0 = run[0].bytes, b1 = run[run.Count - 1].bytes;
-                double runFrames = (b1 - b0) / bpf;
-                if (runFrames < 20) continue;
-                double lo = b0 + 0.10 * (b1 - b0), hi = b0 + 0.90 * (b1 - b0);
-                var pts = run.Where(x => x.bytes >= lo && x.bytes <= hi).ToList();
-                if (pts.Count < 5) continue;
-                double span = (pts[pts.Count - 1].ticks - pts[0].ticks) / f;
-                if (span < 0.3) continue;
-                double t0 = pts[0].ticks, n = pts.Count, sx = 0, sy = 0, sxx = 0, sxy = 0;
-                foreach (var p in pts)
-                {
-                    double x = (p.ticks - t0) / f, y = p.bytes;
-                    sx += x; sy += y; sxx += x * x; sxy += x * y;
-                }
-                double den = n * sxx - sx * sx;
-                if (den <= 0) continue;
-                double rate = (n * sxy - sx * sy) / den / bpf;
-                rSum += rate * runFrames; wSum += runFrames;
-            }
-            if (runs.Count > 1)
-                System.Diagnostics.Debug.WriteLine($"{cam.DeviceName}: {runs.Count} recording runs (trigger paused {runs.Count - 1}x)");
-            return wSum > 0 ? rSum / wSum : 0;
+            if (btnRecordToggle == null) return;
+            bool recording = btnStopRecording.Enabled;
+            btnRecordToggle.Text = recording ? "Stop Recording" : "Start Recording";
+            btnRecordToggle.BackColor = recording ? System.Drawing.Color.IndianRed : System.Drawing.SystemColors.Control;
+            btnRecordToggle.UseVisualStyleBackColor = !recording;
+            btnRecordToggle.Enabled = recording || btnStartRecording.Enabled;
         }
 
         private void UpdateLiveToggle()
@@ -10952,9 +8943,10 @@ namespace QueenPix
         }
 
         // Light preview while recording with the SDK live display off (the live display made the
-        // cameras stall one after another when triggering started). The recorder's writer thread
-        // hands over a half-size copy of a recorded frame twice a second; it is shown in a
-        // PictureBox laid over the camera view. Nothing here runs on the cameras' delivery path.
+        // cameras stall one after another when triggering started). The recorder hands over a
+        // half-size copy of a recorded frame 5 times a second (writer thread; in loop mode the
+        // copy is made right after a frame is stored); it is shown in a PictureBox over the camera
+        // view, with the buffer bar along its top.
         private void ShowRecordingPreview(CameraControl camera)
         {
             var recorder = camera.QueuedRecorder;
@@ -10983,14 +8975,19 @@ namespace QueenPix
                 int w = pb.ClientSize.Width, h = 18;
                 var g = e.Graphics;
                 g.FillRectangle(System.Drawing.Brushes.DimGray, 0, 0, w, h);
-                var barColor = lost > 0 || fill >= 0.8 ? System.Drawing.Color.Red
+                // loop recording: the buffer is meant to fill up (it keeps the last N frames)
+                var barColor = lost > 0 ? System.Drawing.Color.Red
+                             : recorder.IsLoop ? System.Drawing.Color.SteelBlue
+                             : fill >= 0.8 ? System.Drawing.Color.Red
                              : fill >= 0.5 ? System.Drawing.Color.Orange
                              : System.Drawing.Color.ForestGreen;
                 using (var brush = new System.Drawing.SolidBrush(barColor))
                     g.FillRectangle(brush, 0, 0, Math.Max(2, (int)(w * fill)), h);
                 int px = (int)(w * peak);
-                g.DrawLine(System.Drawing.Pens.White, px, 0, px, h - 1);
-                string text = $"Buffer {fill:P0} (peak {peak:P0})   {recorder.FramesReceived} frames   " +
+                if (!recorder.IsLoop) g.DrawLine(System.Drawing.Pens.White, px, 0, px, h - 1);
+                string text = (recorder.IsLoop
+                                  ? $"Loop {recorder.QueueDepth} of {pool} frames   "
+                                  : $"Buffer {fill:P0} (peak {peak:P0})   {recorder.FramesReceived} frames   ") +
                               (lost > 0 ? $"LOST {lost}" : "lost 0");
                 TextRenderer.DrawText(g, text, this.Font, new System.Drawing.Rectangle(4, 0, w - 4, h),
                                       System.Drawing.Color.White,
@@ -11029,66 +9026,6 @@ namespace QueenPix
             pb.Parent?.Controls.Remove(pb);
             pb.Image?.Dispose();
             pb.Dispose();
-        }
-
-        // Diagnostics for missed triggers: frames written per second and pauses in file growth,
-        // per camera, so the missed frames can be located in time and compared between cameras.
-        // Uses the file-growth samples of StartFileGrowthTiming (polled every ~10-16 ms).
-        private void LogFileGrowthTimeline(CameraControl cam, int number, int frames, long fileBytes)
-        {
-            List<(long ticks, long bytes)> s;
-            lock (cam.RecFileSamplesLock) s = new List<(long ticks, long bytes)>(cam.RecFileSamples);
-            if (frames < 10 || fileBytes <= 0 || s.Count < 10)
-            {
-                LogCameraInfo($"Camera {number} timeline: not enough file-growth samples ({s.Count})");
-                return;
-            }
-            double bpf = fileBytes / (double)frames;
-            double f = Stopwatch.Frequency;
-            long nowTicks = Stopwatch.GetTimestamp();
-            DateTime now = DateTime.Now;
-            Func<long, string> clock = t => now.AddSeconds((t - nowTicks) / f).ToString("HH:mm:ss.fff");
-
-            // start at the first frame (the file exists with only its header until the box starts)
-            int start = 0;
-            while (start < s.Count - 1 && s[start].bytes - s[0].bytes < bpf) start++;
-            if (s.Count - start < 10)
-            {
-                LogCameraInfo($"Camera {number} timeline: not enough samples after the first frame");
-                return;
-            }
-
-            // pause = no growth for longer than 50 ms (and longer than 4 typical sample intervals)
-            var dts = new List<double>();
-            for (int k = start + 1; k < s.Count; k++) dts.Add((s[k].ticks - s[k - 1].ticks) / f);
-            dts.Sort();
-            double threshold = Math.Max(0.05, 4 * dts[dts.Count / 2]);
-            var gaps = new List<string>();
-            for (int k = start + 1; k < s.Count; k++)
-            {
-                double dt = (s[k].ticks - s[k - 1].ticks) / f;
-                if (dt > threshold)
-                    gaps.Add($"{clock(s[k - 1].ticks)} +{dt * 1000:F0} ms");
-            }
-
-            // frames written in each whole second from the first frame
-            long t0 = s[start].ticks;
-            var counts = new List<int>();
-            long prevBytes = s[start].bytes;
-            int idx = start;
-            for (int n = 1; ; n++)
-            {
-                long boundary = t0 + (long)(n * f);
-                if (boundary > s[s.Count - 1].ticks) break;
-                while (idx + 1 < s.Count && s[idx + 1].ticks <= boundary) idx++;
-                counts.Add((int)Math.Round((s[idx].bytes - prevBytes) / bpf));
-                prevBytes = s[idx].bytes;
-            }
-            int tail = (int)Math.Round((s[s.Count - 1].bytes - prevBytes) / bpf);
-            LogCameraInfo($"Camera {number} frames per second from {clock(t0)}: {string.Join(" ", counts)} | rest {tail}");
-            LogCameraInfo(gaps.Count == 0
-                ? $"Camera {number} no pauses > {threshold * 1000:F0} ms"
-                : $"Camera {number} pauses > {threshold * 1000:F0} ms: {string.Join(", ", gaps)}");
         }
 
         private void ToggleCameraExpansion(int cameraIndex)
