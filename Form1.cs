@@ -41,6 +41,11 @@ namespace QueenPix
         public List<CameraNameProfile> NameProfiles { get; set; } = new List<CameraNameProfile>();
         public string LastUsedProfile { get; set; } = "";
 
+        // Naming blocks: grids of run names per session (NamingGrid.cs), clicked in the save dialog
+        public bool NamingBlocksEnabled { get; set; } = false;
+        public List<NamingGrid> NamingGrids { get; set; } = new List<NamingGrid>();
+        public string LastNamingGrid { get; set; } = "";
+
         // Camera group assignments: DeviceName → GroupId ("A","B","C","D") or "" = unassigned
         public Dictionary<string, string> CameraGroupAssignments { get; set; } = new();
         public Dictionary<string, string> GroupNames { get; set; } = new()
@@ -116,6 +121,21 @@ namespace QueenPix
             public long LastFrameNumber { get; set; } = -1;
             public int DroppedFrames { get; set; }
             public long ExpectedFrameCount { get; set; }
+            // Real frame timing during a recording (arrival time of the first and last frame),
+            // used to report the TRUE frame rate instead of Start/Stop button times.
+            public volatile bool RecTimingActive;
+            public long RecFirstFrameTicks;
+            public long RecLastFrameTicks;
+            public long RecFrameEvents;
+            public bool HardwareTriggerEnabledByApp;
+            // File-growth samples (time, bytes) of the recording AVI - used when the camera
+            // does not raise per-frame events during recording (MediaStreamSink).
+            public List<(long ticks, long bytes)> RecFileSamples = new List<(long ticks, long bytes)>();
+            public object RecFileSamplesLock = new object();
+            // Buffered recording (RAM queue + writer thread) of the current normal recording, if used
+            public QueuedAviRecorder? QueuedRecorder { get; set; }
+            // Light preview shown over the camera view while recording with the live display off
+            public PictureBox? RecordingPreview { get; set; }
             // Timelapse fields
             public bool IsTimelapseMode { get; set; }
             public DateTime? LastTimelapseCapture { get; set; }
@@ -229,6 +249,7 @@ namespace QueenPix
         private Button btnRefreshCameras = null!;
         private Button btnStartLive = null!;
         private Button btnStopLive = null!;
+        private Button btnLiveToggle = null!;   // the visible Start/Stop Live button
         private Button btnStartRecording = null!;
         private Button btnStopRecording = null!;
         private Button btnScreenshot = null!;
@@ -253,6 +274,11 @@ namespace QueenPix
         
         // Recording state
         private bool isRecording = false;
+        // Normal recordings: frames go into a RAM queue and a writer thread saves them, so a slow
+        // moment on the disk can no longer make the cameras skip triggers (see QueuedAviRecorder).
+        // Off = old direct MediaStreamSink path.
+        private bool _useBufferedRecording = true;
+        private const int RecordBufferMBPerCamera = 1024;
         private bool isTimelapseMode = false; // class-level flag for webcam capture loop
         private string currentRecordingBaseName = ""; // Store the timestamp-based name
         private bool wasLiveBeforeSettings = false;
@@ -436,6 +462,13 @@ namespace QueenPix
             ToolStripMenuItem trimItem = new ToolStripMenuItem("Trim Videos...");
             trimItem.Click += TrimVideosMenuItem_Click;
             toolsMenu.DropDownItems.Add(trimItem);
+            ToolStripMenuItem verifyItem = new ToolStripMenuItem("Verify recording...");
+            verifyItem.Click += (s, e) =>
+            {
+                using var verifyDialog = new VerifyRecordingDialog(FFMPEG_PATH);
+                verifyDialog.ShowDialog(this);
+            };
+            toolsMenu.DropDownItems.Add(verifyItem);
 
             toolsMenu.DropDownItems.Add(new ToolStripSeparator());
             ToolStripMenuItem capacityCalcItem = new ToolStripMenuItem("Loop Recording RAM Calculator...");
@@ -459,6 +492,15 @@ namespace QueenPix
             ToolStripMenuItem profilesItem = new ToolStripMenuItem("Camera Name Profiles...");
             profilesItem.Click += (s, e) => ManageCameraProfiles();
             settingsMenu.DropDownItems.Add(profilesItem);
+
+
+            ToolStripMenuItem bufferedItem = new ToolStripMenuItem("Buffered recording (RAM queue) - recommended")
+            {
+                CheckOnClick = true,
+                Checked = _useBufferedRecording
+            };
+            bufferedItem.CheckedChanged += (s, e) => _useBufferedRecording = bufferedItem.Checked;
+            settingsMenu.DropDownItems.Add(bufferedItem);
             
             settingsMenu.DropDownItems.Add(new ToolStripSeparator());
             ToolStripMenuItem exportSettingsItem = new ToolStripMenuItem("Export Settings...");
@@ -777,10 +819,30 @@ namespace QueenPix
             btnStopLive.Click += BtnStopLive_Click;
             this.Controls.Add(btnStopLive);
 
+            // One visible Live button. The two buttons above stay (hidden) because the rest of the
+            // code enables/disables them to track the live state; the toggle mirrors that state.
+            btnStartLive.Visible = false;
+            btnStopLive.Visible = false;
+            btnLiveToggle = new Button
+            {
+                Text = "Start All Live",
+                Location = ScalePoint(buttonX + buttonSpacing, buttonY),
+                Size = ScaleSize(buttonWidth, 30),
+                Enabled = false
+            };
+            btnLiveToggle.Click += (s, e) =>
+            {
+                if (btnStopLive.Enabled) BtnStopLive_Click(null, EventArgs.Empty);
+                else if (btnStartLive.Enabled) BtnStartLive_Click(null, EventArgs.Empty);
+            };
+            btnStartLive.EnabledChanged += (s, e) => UpdateLiveToggle();
+            btnStopLive.EnabledChanged += (s, e) => UpdateLiveToggle();
+            this.Controls.Add(btnLiveToggle);
+
             btnStartRecording = new Button
             {
                 Text = "Start Recording",
-                Location = ScalePoint(buttonX + buttonSpacing * 3, buttonY),
+                Location = ScalePoint(buttonX + buttonSpacing * 2, buttonY),
                 Size = ScaleSize(buttonWidth, 30),
                 Enabled = false
             };
@@ -790,7 +852,7 @@ namespace QueenPix
             btnStopRecording = new Button
             {
                 Text = "Stop Recording",
-                Location = ScalePoint(buttonX + buttonSpacing * 4, buttonY),
+                Location = ScalePoint(buttonX + buttonSpacing * 3, buttonY),
                 Size = ScaleSize(buttonWidth, 30),
                 Enabled = false
             };
@@ -801,7 +863,7 @@ namespace QueenPix
             Button btnManageCameras = new Button
             {
                 Text = "Manage Cameras",
-                Location = ScalePoint(buttonX + buttonSpacing * 5, buttonY),
+                Location = ScalePoint(buttonX + buttonSpacing * 4, buttonY),
                 Size = ScaleSize(buttonWidth, 30)
             };
             btnManageCameras.Click += BtnManageCameras_Click;
@@ -811,7 +873,7 @@ namespace QueenPix
             btnScreenshot = new Button  // ← Changed from "Button btnScreenshot" to "btnScreenshot"
             {
                 Text = "📷 Screenshot",
-                Location = ScalePoint(buttonX + buttonSpacing * 6, buttonY),
+                Location = ScalePoint(buttonX + buttonSpacing * 5, buttonY),
                 Size = ScaleSize(buttonWidth, 30),
                 Enabled = false
             };
@@ -821,7 +883,7 @@ namespace QueenPix
             btnManageGroups = new Button
             {
                 Text = "👥 Groups",
-                Location = ScalePoint(buttonX + buttonSpacing * 7, buttonY),
+                Location = ScalePoint(buttonX + buttonSpacing * 6, buttonY),
                 Size = ScaleSize(buttonWidth, 30)
             };
             btnManageGroups.Click += (s, e) => ShowGroupsDialog();
@@ -1074,7 +1136,7 @@ namespace QueenPix
                 Location = ScalePoint(buttonX + 525, loopY),
                 Size = ScaleSize(70, 25),
                 Minimum = 1,
-                Maximum = 240,
+                Maximum = 1000,   // label only: the camera's own limit is set from its driver (DeviceFrameRates)
                 DecimalPlaces = 1,
                 Value = 30,
                 Enabled = false,
@@ -1370,6 +1432,8 @@ namespace QueenPix
                     settings.MaxDurationValue = dialog.Settings.MaxDurationValue;
                     settings.MaxDurationUnit = dialog.Settings.MaxDurationUnit;
                     settings.CharlotteMode = dialog.Settings.CharlotteMode;
+                    settings.NamingBlocksEnabled = dialog.Settings.NamingBlocksEnabled;
+                    settings.NamingGrids = dialog.Settings.NamingGrids;
                     settings.Save();
                     UpdateRecordingButtonColor();
                 }
@@ -2028,7 +2092,7 @@ namespace QueenPix
                     Location = new System.Drawing.Point(200, y),
                     Size = new System.Drawing.Size(80, 25),
                     Minimum = 1,
-                    Maximum = 240,
+                    Maximum = 1000,
                     DecimalPlaces = 1,
                     Value = defaultFps
                 };
@@ -2929,6 +2993,8 @@ namespace QueenPix
                         MediaStreamSink sink = new MediaStreamSink((AviCompressor?)null, aviFile);
                         sinks.Add(sink);
                         camera.ImagingControl.Sink = sink;
+                        camera.RecFrameEvents = 0;
+                        camera.RecTimingActive = true;
                         
                         LogCameraInfo($"{camera.CustomName}: Recording to {aviFile}");
                     }
@@ -2995,6 +3061,7 @@ namespace QueenPix
                         
                         // Stop camera
                         camera.ImagingControl.LiveStop();
+                        camera.RecTimingActive = false;
                         
                         // Restore original sink
                         camera.ImagingControl.Sink = camera.OriginalSink;
@@ -4071,8 +4138,11 @@ namespace QueenPix
                    if (camera.Settings != null && !string.IsNullOrEmpty(camera.Settings.Format))
                     {
                         // Try to apply saved format
-                        var savedFormat = camera.ImagingControl.VideoFormats
-                            .FirstOrDefault(f => f.ToString() == camera.Settings.Format);
+                        // a preset, or a free size such as "Y800 (480x800)" made from the format description
+                        var savedFormat = VideoFormatHelper.Find(camera.ImagingControl.VideoFormats,
+                            camera.ImagingControl.VideoFormatDescs, camera.Settings.Format, out string formatProblem);
+                        if (savedFormat == null)
+                            LogCameraInfo($"Camera {i + 1}: saved format '{camera.Settings.Format}' not applied - {formatProblem}");
                         
                         if (savedFormat != null)
                         {
@@ -4084,6 +4154,7 @@ namespace QueenPix
                             catch { }
                         }
                         
+                        SelectFastestFormat(camera);
                         // Apply other saved properties (exposure, gain, etc.)
                         ApplyCameraSettings(camera, camera.Settings);
                     } 
@@ -4096,6 +4167,7 @@ namespace QueenPix
                         if (cameraIndex < cameras.Count)  // Use the existing cameraIndex variable
                         {
                             cameras[cameraIndex].FrameCount++;
+                            RecordFrameTiming(cameras[cameraIndex]);
                             // Debug: Log first 5 frames to verify event is firing
                             if (cameras[cameraIndex].FrameCount <= 5)
                             {
@@ -5017,8 +5089,10 @@ namespace QueenPix
                     // Apply saved format if available
                     if (camera.Settings != null && !string.IsNullOrEmpty(camera.Settings.Format))
                     {
-                        var savedFormat = camera.ImagingControl.VideoFormats
-                            .FirstOrDefault(f => f.ToString() == camera.Settings.Format);
+                        var savedFormat = VideoFormatHelper.Find(camera.ImagingControl.VideoFormats,
+                            camera.ImagingControl.VideoFormatDescs, camera.Settings.Format, out string formatProblem);
+                        if (savedFormat == null)
+                            LogCameraInfo($"Camera {camera.DeviceName}: saved format '{camera.Settings.Format}' not applied - {formatProblem}");
                         
                         if (savedFormat != null)
                         {
@@ -5029,6 +5103,7 @@ namespace QueenPix
                             catch { }
                         }
                         
+                        SelectFastestFormat(camera);
                         ApplyCameraSettings(camera, camera.Settings);
                     }
                     
@@ -5037,6 +5112,7 @@ namespace QueenPix
                         if (cameraIndex < cameras.Count)
                         {
                             cameras[cameraIndex].FrameCount++;
+                            RecordFrameTiming(cameras[cameraIndex]);
                         }
                     };
                     
@@ -5217,7 +5293,31 @@ namespace QueenPix
                     return;
                 }
                 
-                // Try to find and toggle trigger-related properties using the correct API
+                if (isRecording)
+                {
+                    MessageBox.Show("Stop the recording before switching the trigger.", "Recording",
+                                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                // Preferred path: the camera's trigger "Enable" switch. The button and the settings
+                // window's Frame Rate Control (External Trigger / Software Controlled) now always agree.
+                var enableSw = FindTriggerEnableSwitch(camera.ImagingControl);
+                if (enableSw != null && !enableSw.ReadOnly)
+                {
+                    bool turnOn = !enableSw.Switch;
+                    bool wasLive = camera.ImagingControl.LiveVideoRunning;
+                    if (wasLive) camera.ImagingControl.LiveStop();
+                    camera.Settings.UseExternalTrigger = turnOn;
+                    ConfigureCameraTrigger(camera, turnOn);
+                    if (wasLive) camera.ImagingControl.LiveStart();
+                    settings.CameraSettingsByDevice[camera.DeviceName] = camera.Settings.Clone();
+                    settings.Save();
+                    LogCameraInfo($"Camera {cameraIndex + 1}: Trigger button -> camera trigger {(turnOn ? "ON (External Trigger)" : "OFF (Software Controlled)")}");
+                    return;
+                }
+
+                // Fallback (other camera models): try to find and toggle trigger-related properties
                 // Based on TIS.Imaging SDK documentation: iterate through Items -> Elements -> Interfaces
                 bool triggerToggled = false;
                 string[] triggerPropertyNames = { "Trigger", "Trigger On/Off", "TriggerMode", "TriggerSoftware", "Trigger Software", "TriggerEnable" };
@@ -5553,7 +5653,7 @@ namespace QueenPix
                     try
                     {
                         camera.ImagingControl.VCDPropertyItems.Load(settings.VCDPropertiesXml);
-                        LogCameraInfo($"Loaded VCD properties for {camera.DeviceName}");
+                        LogCameraInfo($"Loaded VCD properties for {camera.DeviceName} - frame-rate list max now {MaxRate(camera.ImagingControl):F1} fps");
                     }
                     catch (Exception ex)
                     {
@@ -5615,11 +5715,28 @@ namespace QueenPix
                         {
                             LogCameraInfo($"Camera {camera.DeviceName}: Frame rate control not supported");
                         }
+
+                        // "Software Controlled" selected -> camera trigger must be OFF (free-running)
+                        try
+                        {
+                            var sw = FindTriggerEnableSwitch(camera.ImagingControl);
+                            if (sw != null && sw.Switch && !sw.ReadOnly)
+                            {
+                                sw.Switch = false;
+                                LogCameraInfo($"Camera {camera.DeviceName}: camera trigger switched OFF (software-controlled frame rate)");
+                            }
+                            UpdateTriggerButton(camera);
+                        }
+                        catch (Exception swEx)
+                        {
+                            LogCameraInfo($"Camera {camera.DeviceName}: could not switch camera trigger off: {swEx.Message}");
+                        }
                     }
                     else
                     {
-                        // External trigger mode - don't set software frame rate
-                        LogCameraInfo($"Camera {camera.DeviceName}: Using EXTERNAL TRIGGER (software frame rate not applied)");
+                        // External trigger: arm the camera's trigger and make sure its internal frame
+                        // rate is as high as possible (otherwise triggers above that rate are skipped).
+                        ConfigureCameraTrigger(camera, true);
                     }
                 }
                 catch (Exception ex)
@@ -6474,6 +6591,12 @@ namespace QueenPix
 
                 // Generate timestamp for filenames
                 string timestamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss-fff");
+
+                // Naming blocks on: screenshots start with the session prefix (S1_2026-..._L.png), so the
+                // plate calibration images are linked to that session (asks which one if there are several)
+                string? shotPrefix = NamingBlockPrompt.ScreenshotPrefix(this, settings);
+                if (shotPrefix == null) return;
+                timestamp = shotPrefix + timestamp;
                 
                 int savedCount = 0;
                 List<string> errors = new List<string>();
@@ -6948,6 +7071,20 @@ namespace QueenPix
                             catch { }
                             
                             LogCameraInfo($"Camera {i + 1}: Checking format - Current: {currentFormatStr}");
+                            // External trigger: make sure the camera is really armed before recording
+                            if (camera.IsImagingSource && camera.Settings != null && camera.Settings.UseExternalTrigger)
+                            {
+                                bool armed = false;
+                                try { armed = FindTriggerEnableSwitch(camera.ImagingControl)?.Switch == true; } catch { }
+                                if (!armed)
+                                {
+                                    LogCameraInfo($"Camera {i + 1}: trigger was NOT armed at recording start - arming now");
+                                    ConfigureCameraTrigger(camera, true);
+                                    try { armed = FindTriggerEnableSwitch(camera.ImagingControl)?.Switch == true; } catch { }
+                                    if (!armed)
+                                        LogCameraInfo($"WARNING: Camera {i + 1} is NOT triggered - its frames will not be in sync with the box");
+                                }
+                            }
                             
                             // All formats: Use MediaStreamSink (preserves quality)
                             // Overlay will be applied during conversion/trimming using FFmpeg
@@ -6959,7 +7096,26 @@ namespace QueenPix
                                 $"{currentRecordingBaseName}_{safeName}.avi");
                             
                             camera.RecordingFilePath = aviFilename;
-                            camera.ImagingControl.Sink = new MediaStreamSink((AviCompressor?)null, aviFilename);
+                            camera.QueuedRecorder = null;
+                            if (_useBufferedRecording)
+                            {
+                                double headerFps = camera.Settings?.UseExternalTrigger == true
+                                    ? (double)numExternalTriggerFps.Value
+                                    : camera.Settings?.SoftwareFrameRate ?? 0;
+                                var recorder = new QueuedAviRecorder(aviFilename, $"Camera {i + 1}",
+                                    camera.ImagingControl.ImageWidth, camera.ImagingControl.ImageHeight,
+                                    headerFps, RecordBufferMBPerCamera, LogCameraInfo);
+                                camera.QueuedRecorder = recorder;
+                                camera.ImagingControl.Sink = recorder.Sink;
+                            }
+                            else
+                            {
+                                camera.ImagingControl.Sink = new MediaStreamSink((AviCompressor?)null, aviFilename);
+                            }
+                            camera.RecFrameEvents = 0;
+                            camera.RecTimingActive = true;   // time every frame from now until LiveStop
+                            if (camera.QueuedRecorder == null)
+                                StartFileGrowthTiming(camera, aviFilename);
                             
                             LogCameraInfo($"Camera {i + 1} recording mode configured: {aviFilename}");
                         }
@@ -6979,6 +7135,15 @@ namespace QueenPix
                     {
                         if (camera.IsImagingSource)
                         {
+                            if (!isLoopMode && !isTimelapseMode)
+                            {
+                                // The SDK's live display makes the cameras stall one after another when
+                                // triggering starts (6 Nov 2026), so it is always off while recording.
+                                // The light preview (recorded frames, half size) replaces it.
+                                camera.ImagingControl.LiveDisplay = false;
+                                if (camera.QueuedRecorder != null)
+                                    ShowRecordingPreview(camera);
+                            }
                             camera.ImagingControl.LiveStart();
                             System.Threading.Thread.Sleep(10);
                         }
@@ -7678,8 +7843,21 @@ namespace QueenPix
 
                                 if (camera.IsImagingSource)
                                 {
+                                    LogFrameDropCounters(camera, i + 1);   // must be read BEFORE LiveStop
                                     camera.ImagingControl.LiveStop();
+                                    camera.RecTimingActive = false;
+                                    if (camera.QueuedRecorder != null)
+                                    {
+                                        RemoveRecordingPreview(camera);
+                                        // write what is still in the RAM queue and close the AVI
+                                        camera.QueuedRecorder.Finish();
+                                        if (camera.QueuedRecorder.FramesLost > 0)
+                                            camera.DroppedFrames = Math.Max(0, camera.DroppedFrames)
+                                                                   + (int)camera.QueuedRecorder.FramesLost;
+                                    }
                                     camera.ImagingControl.Sink = camera.OriginalSink;
+                                    camera.QueuedRecorder?.DisposeSink();
+                                    camera.ImagingControl.LiveDisplay = true;   // preview back on after recording
                                     camera.ImagingControl.LiveStart();
                                 }
                                 else
@@ -7791,6 +7969,33 @@ namespace QueenPix
                                 {
                                     actualDuration = (camera.RecordingStopTime.Value - camera.RecordingStartTime.Value).TotalSeconds;
                                 }
+
+                                // Prefer the REAL frame rate measured from frame arrival times. The Start/Stop
+                                // button times include the camera/file start-up delay and idle time before the
+                                // trigger is switched on, which made the reported fps too low.
+                                long aviBytes = 0;
+                                try { aviBytes = new FileInfo(aviFile).Length; } catch { }
+                                double measuredFps = camera.QueuedRecorder != null
+                                    ? camera.QueuedRecorder.MeasuredFps()
+                                    : MeasuredRecordingFps(camera, frameCount, aviBytes);
+                                if (measuredFps > 0)
+                                {
+                                    LogCameraInfo($"Camera {i + 1}: measured frame rate {measuredFps:F2} fps " +
+                                                  $"(button-time estimate was {(actualDuration > 0 ? frameCount / actualDuration : 0):F2} fps)");
+                                    actualDuration = frameCount / measuredFps;
+                                }
+                                else
+                                {
+                                    LogCameraInfo($"Camera {i + 1}: no frame timing available - fps estimated from Start/Stop times");
+                                }
+                                if (camera.QueuedRecorder != null)
+                                {
+                                    long missed = camera.QueuedRecorder.LogTimeline($"Camera {i + 1}");
+                                    if (missed > 0)   // ignored triggers: invisible to the SDK counters
+                                        camera.DroppedFrames = Math.Max(0, camera.DroppedFrames) + (int)missed;
+                                }
+                                else
+                                    LogFileGrowthTimeline(camera, i + 1, frameCount, aviBytes);
                             }
                             
                             double aviDuration = GetVideoDuration(aviFile);
@@ -7802,7 +8007,7 @@ namespace QueenPix
                             {
                                 LogCameraInfo($"⚠️ Camera {i + 1} DROPPED {camera.DroppedFrames} frames during recording!");
                             }
-                            else
+                            else if (camera.DroppedFrames == 0)
                             {
                                 LogCameraInfo($"✅ Camera {i + 1} captured all frames without drops");
                             }
@@ -7813,6 +8018,8 @@ namespace QueenPix
                             // not for the original temporary recording files
                         }
                     }
+
+                    foreach (var doneCam in targets) doneCam.QueuedRecorder = null;   // free the recorders (timeline/fps done)
 
                     // Remove files that have 0 frames (recording too short / empty AVI)
                     for (int i = frameStats.Count - 1; i >= 0; i--)
@@ -7842,7 +8049,8 @@ namespace QueenPix
                         aviFileSizes,
                         aviFiles,
                         txtWorkingFolder.Text,
-                        groupBaseName))
+                        groupBaseName,
+                        settings))
                     {
                         if (dialog.ShowDialog() == DialogResult.OK)
                         {
@@ -10228,6 +10436,7 @@ namespace QueenPix
         {
             try
             {
+                if (!IsHandleCreated) return;   // called during start-up, before the window exists
                 string workingFolder = txtWorkingFolder.Text;
                 if (string.IsNullOrEmpty(workingFolder) || !Directory.Exists(workingFolder))
                     return;
@@ -10391,8 +10600,500 @@ namespace QueenPix
         }
 
 
+        // Reads the SDK's own frame-drop counters for the running stream and logs them. Call it
+        // BEFORE LiveStop - the counters belong to the live run. The driver breakdown says WHERE
+        // frames were lost: in the camera (trigger skipped), on USB (packet loss), in format
+        // conversion (transforms), or because the application/sink queue was full.
+        // Stores the total in camera.DroppedFrames (-1 = counters not available).
+        private void LogFrameDropCounters(CameraControl camera, int number)
+        {
+            var ic = camera.ImagingControl;
+            camera.DroppedFrames = -1;
+            try
+            {
+                long dropped = ic.DeviceCountOfFramesDropped;
+                long notDropped = ic.DeviceCountOfFramesNotDropped;
+                camera.DroppedFrames = (int)dropped;
+                LogCameraInfo($"Camera {number} SDK counters: not dropped {notDropped}, dropped {dropped}");
+            }
+            catch (Exception ex)
+            {
+                LogCameraInfo($"Camera {number}: device drop counters not available: {ex.Message}");
+            }
+            try
+            {
+                var d = ic.DriverFrameDropInformation;
+                LogCameraInfo($"Camera {number} driver: delivered {d.FramesDelivered}, " +
+                              $"dropped in device {d.FramesDroppedInDevice}, " +
+                              $"packet loss {d.FramesDroppedDueToPacketLoss}, " +
+                              $"transforms {d.FramesDroppedDueToTransforms}, " +
+                              $"application queue {d.FramesDroppedDueToApplicationQueue}, " +
+                              $"unspecified {d.FramesDroppedDueUnspecified}");
+            }
+            catch (Exception ex)
+            {
+                LogCameraInfo($"Camera {number}: driver drop information not available: {ex.Message}");
+            }
+        }
+
+        // Called for every frame (ImageAvailable). Records the arrival time of the first and the
+        // latest frame while a recording is running.
+        private static void RecordFrameTiming(CameraControl cam)
+        {
+            if (!cam.RecTimingActive) return;
+            long t = Stopwatch.GetTimestamp();
+            if (cam.RecFrameEvents == 0) cam.RecFirstFrameTicks = t;
+            cam.RecLastFrameTicks = t;
+            cam.RecFrameEvents++;
+        }
+
+        // True frame rate of the last recording, from frame arrival times (0 if not available).
+        // Uses the frames between the first and last frame, so start-up delay and idle time
+        // (e.g. trigger switched on after Start Recording) do not count.
+        private static double MeasuredRecordingFps(CameraControl cam, int framesInFile, long fileBytes)
+        {
+            long events = cam.RecFrameEvents;
+            if (events < 10) return MeasuredFpsFromFileGrowth(cam, framesInFile, fileBytes);
+            double seconds = (cam.RecLastFrameTicks - cam.RecFirstFrameTicks) / (double)Stopwatch.Frequency;
+            if (seconds <= 0) return 0;
+            // If (nearly) every frame raised an event, count the events themselves; otherwise use
+            // the number of frames in the file over the same first-to-last span.
+            long frames = (framesInFile > 0 && events < 0.9 * framesInFile) ? framesInFile : events;
+            return (frames - 1) / seconds;
+        }
+
+        // Puts a camera into external-trigger mode (external = true) or free-running mode.
+        // External: trigger OFF -> re-apply the video format (the driver builds its frame-rate list
+        // when the format is set, and builds a reduced list - max 90 fps here - if the trigger is on
+        // at that moment) -> set the MAXIMUM frame rate -> trigger ON. The camera skips any trigger
+        // that arrives faster than its internal frame rate, so that rate must be above the box rate.
+        private void ConfigureCameraTrigger(CameraControl camera, bool external)
+        {
+            var ic = camera.ImagingControl;
+            VCDSwitchProperty? sw = null;
+            // The property list can be empty for a moment right after a camera (re)connects: retry.
+            for (int attempt = 0; attempt < 10 && sw == null; attempt++)
+            {
+                try { sw = FindTriggerEnableSwitch(ic); }
+                catch (Exception ex) { if (attempt == 9) LogCameraInfo($"Camera {camera.DeviceName}: trigger switch lookup failed: {ex.Message}"); }
+                if (sw == null) System.Threading.Thread.Sleep(100);
+            }
+            if (sw == null)
+                LogCameraInfo($"WARNING: Camera {camera.DeviceName}: trigger property not found (device valid = {SafeDeviceValid(ic)}) - " +
+                              "camera is NOT triggered and will free-run. Unplug/replug it or press Refresh Cameras.");
+
+            if (!external)
+            {
+                try { if (sw != null && sw.Switch && !sw.ReadOnly) sw.Switch = false; }
+                catch (Exception ex) { LogCameraInfo($"Camera {camera.DeviceName}: could not switch trigger off: {ex.Message}"); }
+                try
+                {
+                    if (ic.DeviceFrameRateAvailable && camera.Settings.SoftwareFrameRate > 0)
+                    {
+                        float[] rates = ic.DeviceFrameRates;
+                        float target = camera.Settings.SoftwareFrameRate;
+                        ic.DeviceFrameRate = (rates != null && rates.Length > 0)
+                            ? rates.OrderBy(r => Math.Abs(r - target)).First() : target;
+                    }
+                }
+                catch (Exception ex) { LogCameraInfo($"Camera {camera.DeviceName}: could not set software frame rate: {ex.Message}"); }
+                camera.HardwareTriggerEnabledByApp = false;
+                LogCameraInfo($"Camera {camera.DeviceName}: SOFTWARE CONTROLLED - trigger OFF, device frame rate {SafeRate(ic):F1} fps");
+                UpdateTriggerButton(camera);
+                return;
+            }
+
+            bool wasOn = false;
+            try { if (sw != null && sw.Switch && !sw.ReadOnly) { wasOn = true; sw.Switch = false; } }
+            catch (Exception ex) { LogCameraInfo($"Camera {camera.DeviceName}: could not switch trigger off: {ex.Message}"); }
+
+            float listMaxBefore = MaxRate(ic);
+            try
+            {
+                if (!ic.LiveVideoRunning)
+                {
+                    var fmt = ic.VideoFormat;
+                    if (fmt != null) ic.VideoFormat = fmt;   // rebuild the frame-rate list with trigger OFF
+                }
+                else LogCameraInfo($"Camera {camera.DeviceName}: live view running - video format not re-applied");
+            }
+            catch (Exception ex) { LogCameraInfo($"Camera {camera.DeviceName}: could not re-apply video format: {ex.Message}"); }
+
+            float listMax = MaxRate(ic);
+            try { if (ic.DeviceFrameRateAvailable && listMax > 0) ic.DeviceFrameRate = listMax; }
+            catch (Exception ex) { LogCameraInfo($"Camera {camera.DeviceName}: could not set max frame rate: {ex.Message}"); }
+
+            try
+            {
+                if (sw == null) sw = FindTriggerEnableSwitch(ic);
+                if (sw != null && !sw.ReadOnly) sw.Switch = true;
+            }
+            catch (Exception ex) { LogCameraInfo($"Camera {camera.DeviceName}: could not arm trigger: {ex.Message}"); }
+
+            camera.HardwareTriggerEnabledByApp = sw?.Switch == true;
+            LogCameraInfo($"Camera {camera.DeviceName}: EXTERNAL TRIGGER - frame-rate list max {listMaxBefore:F1} -> {listMax:F1} fps " +
+                          $"after re-applying format with trigger off; device frame rate {SafeRate(ic):F1} fps; " +
+                          $"camera trigger ARMED = {sw?.Switch} (was {(wasOn ? "on" : "off")})");
+            UpdateTriggerButton(camera);
+        }
+
+        // The camera offers several formats; their frame-rate limits differ a lot (a full-sensor
+        // scaled/binned mode can be capped near 90 fps while a 640x480 region runs at 300+ fps).
+        // With the trigger OFF, try every format with the same colour type and resolution as the
+        // chosen one, log each one's maximum frame rate, and keep the fastest.
+        private void SelectFastestFormat(CameraControl camera)
+        {
+            var ic = camera.ImagingControl;
+            try
+            {
+                if (ic.LiveVideoRunning || ic.VideoFormats == null) return;
+                VideoFormat? current = ic.VideoFormatCurrent;
+                if (current == null)
+                {
+                    string want = ic.VideoFormat?.ToString() ?? camera.Settings?.Format ?? "";
+                    current = ic.VideoFormats.FirstOrDefault(f => f.ToString() == want);
+                }
+                if (current == null) return;
+
+                var sw = FindTriggerEnableSwitch(ic);
+                bool trigWasOn = false;
+                try { if (sw != null && sw.Switch && !sw.ReadOnly) { trigWasOn = true; sw.Switch = false; } } catch { }
+
+                string res = $"{current.Width}x{current.Height}";
+                string type = current.ToString().Split(' ')[0];
+                LogCameraInfo($"Camera {camera.DeviceName}: format scan (trigger off) - current '{current}' list max {MaxRate(ic):F1} fps; {ic.VideoFormats.Length} formats offered");
+
+                VideoFormat? best = current;
+                float bestMax = -1f;
+                foreach (var f in ic.VideoFormats)
+                {
+                    string name = f.ToString();
+                    bool sameKind = name.StartsWith(type) && f.Width == current.Width && f.Height == current.Height;
+                    if (!sameKind && !name.Contains(res)) continue;
+                    try
+                    {
+                        ic.VideoFormat = f;
+                        float m = MaxRate(ic);
+                        LogCameraInfo($"    '{name}'  {f.Width}x{f.Height}  max {m:F1} fps{(sameKind ? "" : "  (other type, not chosen)")}");
+                        if (sameKind && m > bestMax) { bestMax = m; best = f; }
+                    }
+                    catch (Exception ex) { LogCameraInfo($"    '{name}' could not be set: {ex.Message}"); }
+                }
+                if (best != null) ic.VideoFormat = best;
+                LogCameraInfo($"Camera {camera.DeviceName}: using '{ic.VideoFormat}' - frame-rate list {SafeMin(ic):F1} - {MaxRate(ic):F1} fps");
+                if (ic.VideoFormats.All(f => f.Width <= 640 && f.Height <= 480))
+                    LogCameraInfo($"WARNING: Camera {camera.DeviceName} offers no format larger than 640x480 - it is probably connected at USB 2.0 speed " +
+                                  "(cable not fully seated, USB 2.0 cable/extension/adapter, or USB 2.0 port). Frame rate will be capped near 90 fps.");
+
+                try { if (trigWasOn && sw != null) sw.Switch = true; } catch { }
+            }
+            catch (Exception ex) { LogCameraInfo($"Camera {camera.DeviceName}: format scan failed: {ex.Message}"); }
+        }
+
+        private static float SafeMin(ICImagingControl ic)
+        {
+            try { var r = ic.DeviceFrameRates; return (r != null && r.Length > 0) ? r.Min() : 0f; }
+            catch { return 0f; }
+        }
+
+        private static bool SafeDeviceValid(ICImagingControl ic)
+        {
+            try { return ic.DeviceValid; } catch { return false; }
+        }
+
+        private static float MaxRate(ICImagingControl ic)
+        {
+            try { var r = ic.DeviceFrameRates; return (r != null && r.Length > 0) ? r.Max() : 0f; }
+            catch { return 0f; }
+        }
+
+        private static float SafeRate(ICImagingControl ic)
+        {
+            try { return ic.DeviceFrameRate; } catch { return 0f; }
+        }
+
+        // Shows the camera's REAL trigger state on its Trigger button.
+        private void UpdateTriggerButton(CameraControl camera)
+        {
+            try
+            {
+                if (camera.TriggerButton == null || !camera.IsImagingSource) return;
+                bool on = FindTriggerEnableSwitch(camera.ImagingControl)?.Switch == true;
+                void apply()
+                {
+                    camera.TriggerButton.Text = on ? "● Trigger ON" : "○ Trigger OFF";
+                    camera.TriggerButton.ForeColor = on ? System.Drawing.Color.DarkGreen : System.Drawing.Color.DimGray;
+                }
+                if (camera.TriggerButton.IsHandleCreated && camera.TriggerButton.InvokeRequired)
+                    camera.TriggerButton.BeginInvoke((Action)apply);
+                else
+                    apply();
+            }
+            catch { }
+        }
+
+        // Finds the camera's trigger "Enable" switch the same way the Trigger button does
+        // (by property name), which works on the DMK 23UP1300.
+        private static VCDSwitchProperty? FindTriggerEnableSwitch(ICImagingControl ic)
+        {
+            if (ic.VCDPropertyItems == null) return null;
+            foreach (VCDPropertyItem item in ic.VCDPropertyItems)
+            {
+                if ((item.Name ?? "").IndexOf("Trigger", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                foreach (VCDPropertyElement element in item.Elements)
+                {
+                    string elName = element.Name ?? "";
+                    if (!elName.Equals("Enable", StringComparison.OrdinalIgnoreCase) &&
+                        !elName.Equals("Value", StringComparison.OrdinalIgnoreCase)) continue;
+                    foreach (VCDPropertyInterface itf in element)
+                    {
+                        if (itf.InterfaceGUID == VCDGUIDs.VCDInterface_Switch)
+                            return (VCDSwitchProperty)itf;
+                    }
+                }
+            }
+            return null;
+        }
+
+        // Samples the size of the recording file every ~10 ms while recording. Each frame adds a
+        // fixed number of bytes, so the growth over time gives the true frame rate.
+        private static void StartFileGrowthTiming(CameraControl cam, string path)
+        {
+            lock (cam.RecFileSamplesLock) cam.RecFileSamples.Clear();
+            System.Threading.Tasks.Task.Run(async () =>
+            {
+                long lastLen = -1;
+                while (cam.RecTimingActive)
+                {
+                    try
+                    {
+                        using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read,
+                                                       FileShare.ReadWrite | FileShare.Delete))
+                        {
+                            long len = fs.Length;
+                            if (len != lastLen)
+                            {
+                                lastLen = len;
+                                long t = Stopwatch.GetTimestamp();
+                                lock (cam.RecFileSamplesLock) cam.RecFileSamples.Add((t, len));
+                            }
+                        }
+                    }
+                    catch { /* file not created yet */ }
+                    await System.Threading.Tasks.Task.Delay(10);
+                }
+            });
+        }
+
+        // True fps from how fast the recording file grows while recording (see below).
+        private static double MeasuredFpsFromFileGrowth(CameraControl cam, int frames, long fileBytes)
+        {
+            // The file grows only while frames arrive. Split the recording into "runs" of continuous
+            // growth (a pause = trigger switched off), fit the steady-state slope of file size vs time
+            // inside each run (inner 10-90 %, so the start-up burst and the flush at stop are left out),
+            // and combine the runs weighted by their frame count. Pauses therefore do not lower the
+            // result, however many times the trigger is switched on and off.
+            List<(long ticks, long bytes)> s;
+            lock (cam.RecFileSamplesLock) s = new List<(long ticks, long bytes)>(cam.RecFileSamples);
+            if (frames < 10 || fileBytes <= 0 || s.Count < 10) return 0;
+            double bpf = fileBytes / (double)frames;     // header + index add < 0.1 %
+            double f = Stopwatch.Frequency;
+
+            // typical time between growth events -> pause threshold
+            var dts = new List<double>();
+            for (int k = 1; k < s.Count; k++) dts.Add((s[k].ticks - s[k - 1].ticks) / f);
+            dts.Sort();
+            double medDt = dts[dts.Count / 2];
+            double gap = Math.Max(0.25, 8 * medDt);
+
+            var runs = new List<List<(long ticks, long bytes)>>();
+            var cur = new List<(long ticks, long bytes)> { s[0] };
+            for (int k = 1; k < s.Count; k++)
+            {
+                if ((s[k].ticks - s[k - 1].ticks) / f > gap) { runs.Add(cur); cur = new List<(long ticks, long bytes)>(); }
+                cur.Add(s[k]);
+            }
+            runs.Add(cur);
+
+            double wSum = 0, rSum = 0;
+            foreach (var run in runs)
+            {
+                if (run.Count < 6) continue;
+                long b0 = run[0].bytes, b1 = run[run.Count - 1].bytes;
+                double runFrames = (b1 - b0) / bpf;
+                if (runFrames < 20) continue;
+                double lo = b0 + 0.10 * (b1 - b0), hi = b0 + 0.90 * (b1 - b0);
+                var pts = run.Where(x => x.bytes >= lo && x.bytes <= hi).ToList();
+                if (pts.Count < 5) continue;
+                double span = (pts[pts.Count - 1].ticks - pts[0].ticks) / f;
+                if (span < 0.3) continue;
+                double t0 = pts[0].ticks, n = pts.Count, sx = 0, sy = 0, sxx = 0, sxy = 0;
+                foreach (var p in pts)
+                {
+                    double x = (p.ticks - t0) / f, y = p.bytes;
+                    sx += x; sy += y; sxx += x * x; sxy += x * y;
+                }
+                double den = n * sxx - sx * sx;
+                if (den <= 0) continue;
+                double rate = (n * sxy - sx * sy) / den / bpf;
+                rSum += rate * runFrames; wSum += runFrames;
+            }
+            if (runs.Count > 1)
+                System.Diagnostics.Debug.WriteLine($"{cam.DeviceName}: {runs.Count} recording runs (trigger paused {runs.Count - 1}x)");
+            return wSum > 0 ? rSum / wSum : 0;
+        }
+
+        private void UpdateLiveToggle()
+        {
+            if (btnLiveToggle == null) return;
+            bool live = btnStopLive.Enabled;
+            btnLiveToggle.Text = live ? "Stop All Live" : "Start All Live";
+            btnLiveToggle.Enabled = live || btnStartLive.Enabled;
+        }
+
+        // Light preview while recording with the SDK live display off (the live display made the
+        // cameras stall one after another when triggering started). The recorder's writer thread
+        // hands over a half-size copy of a recorded frame twice a second; it is shown in a
+        // PictureBox laid over the camera view. Nothing here runs on the cameras' delivery path.
+        private void ShowRecordingPreview(CameraControl camera)
+        {
+            var recorder = camera.QueuedRecorder;
+            var parent = camera.ImagingControl.Parent;
+            if (recorder == null || parent == null) return;
+
+            var pb = new PictureBox
+            {
+                Bounds = camera.ImagingControl.Bounds,
+                SizeMode = PictureBoxSizeMode.Zoom,
+                BackColor = System.Drawing.Color.Black
+            };
+            parent.Controls.Add(pb);
+            pb.BringToFront();
+            camera.RecordingPreview = pb;
+
+            // Buffer bar along the top of the preview (like StreamPix): green < 50 %, orange < 80 %,
+            // red above that or as soon as any frame was lost. White tick = highest fill so far.
+            pb.Paint += (s, e) =>
+            {
+                int pool = recorder.PoolFrames;
+                if (pool <= 0) return;
+                double fill = Math.Min(1.0, (double)recorder.QueueDepth / pool);
+                double peak = Math.Min(1.0, (double)recorder.MaxQueueDepth / pool);
+                long lost = recorder.FramesLost;
+                int w = pb.ClientSize.Width, h = 18;
+                var g = e.Graphics;
+                g.FillRectangle(System.Drawing.Brushes.DimGray, 0, 0, w, h);
+                var barColor = lost > 0 || fill >= 0.8 ? System.Drawing.Color.Red
+                             : fill >= 0.5 ? System.Drawing.Color.Orange
+                             : System.Drawing.Color.ForestGreen;
+                using (var brush = new System.Drawing.SolidBrush(barColor))
+                    g.FillRectangle(brush, 0, 0, Math.Max(2, (int)(w * fill)), h);
+                int px = (int)(w * peak);
+                g.DrawLine(System.Drawing.Pens.White, px, 0, px, h - 1);
+                string text = $"Buffer {fill:P0} (peak {peak:P0})   {recorder.FramesReceived} frames   " +
+                              (lost > 0 ? $"LOST {lost}" : "lost 0");
+                TextRenderer.DrawText(g, text, this.Font, new System.Drawing.Rectangle(4, 0, w - 4, h),
+                                      System.Drawing.Color.White,
+                                      TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
+            };
+            var barTimer = new System.Windows.Forms.Timer { Interval = 250 };
+            barTimer.Tick += (s, e) => { if (!pb.IsDisposed) pb.Invalidate(); };
+            barTimer.Start();
+            pb.Tag = barTimer;
+
+            recorder.PreviewFrame = bmp =>
+            {
+                try
+                {
+                    if (pb.IsDisposed || !pb.IsHandleCreated) { bmp.Dispose(); return; }
+                    pb.BeginInvoke(new Action(() =>
+                    {
+                        if (pb.IsDisposed) { bmp.Dispose(); return; }
+                        pb.Bounds = camera.ImagingControl.Bounds;   // follow layout changes
+                        var old = pb.Image;
+                        pb.Image = bmp;
+                        old?.Dispose();
+                    }));
+                }
+                catch { bmp.Dispose(); }
+            };
+        }
+
+        private void RemoveRecordingPreview(CameraControl camera)
+        {
+            if (camera.QueuedRecorder != null) camera.QueuedRecorder.PreviewFrame = null;
+            var pb = camera.RecordingPreview;
+            camera.RecordingPreview = null;
+            if (pb == null) return;
+            if (pb.Tag is System.Windows.Forms.Timer barTimer) { barTimer.Stop(); barTimer.Dispose(); }
+            pb.Parent?.Controls.Remove(pb);
+            pb.Image?.Dispose();
+            pb.Dispose();
+        }
+
+        // Diagnostics for missed triggers: frames written per second and pauses in file growth,
+        // per camera, so the missed frames can be located in time and compared between cameras.
+        // Uses the file-growth samples of StartFileGrowthTiming (polled every ~10-16 ms).
+        private void LogFileGrowthTimeline(CameraControl cam, int number, int frames, long fileBytes)
+        {
+            List<(long ticks, long bytes)> s;
+            lock (cam.RecFileSamplesLock) s = new List<(long ticks, long bytes)>(cam.RecFileSamples);
+            if (frames < 10 || fileBytes <= 0 || s.Count < 10)
+            {
+                LogCameraInfo($"Camera {number} timeline: not enough file-growth samples ({s.Count})");
+                return;
+            }
+            double bpf = fileBytes / (double)frames;
+            double f = Stopwatch.Frequency;
+            long nowTicks = Stopwatch.GetTimestamp();
+            DateTime now = DateTime.Now;
+            Func<long, string> clock = t => now.AddSeconds((t - nowTicks) / f).ToString("HH:mm:ss.fff");
+
+            // start at the first frame (the file exists with only its header until the box starts)
+            int start = 0;
+            while (start < s.Count - 1 && s[start].bytes - s[0].bytes < bpf) start++;
+            if (s.Count - start < 10)
+            {
+                LogCameraInfo($"Camera {number} timeline: not enough samples after the first frame");
+                return;
+            }
+
+            // pause = no growth for longer than 50 ms (and longer than 4 typical sample intervals)
+            var dts = new List<double>();
+            for (int k = start + 1; k < s.Count; k++) dts.Add((s[k].ticks - s[k - 1].ticks) / f);
+            dts.Sort();
+            double threshold = Math.Max(0.05, 4 * dts[dts.Count / 2]);
+            var gaps = new List<string>();
+            for (int k = start + 1; k < s.Count; k++)
+            {
+                double dt = (s[k].ticks - s[k - 1].ticks) / f;
+                if (dt > threshold)
+                    gaps.Add($"{clock(s[k - 1].ticks)} +{dt * 1000:F0} ms");
+            }
+
+            // frames written in each whole second from the first frame
+            long t0 = s[start].ticks;
+            var counts = new List<int>();
+            long prevBytes = s[start].bytes;
+            int idx = start;
+            for (int n = 1; ; n++)
+            {
+                long boundary = t0 + (long)(n * f);
+                if (boundary > s[s.Count - 1].ticks) break;
+                while (idx + 1 < s.Count && s[idx + 1].ticks <= boundary) idx++;
+                counts.Add((int)Math.Round((s[idx].bytes - prevBytes) / bpf));
+                prevBytes = s[idx].bytes;
+            }
+            int tail = (int)Math.Round((s[s.Count - 1].bytes - prevBytes) / bpf);
+            LogCameraInfo($"Camera {number} frames per second from {clock(t0)}: {string.Join(" ", counts)} | rest {tail}");
+            LogCameraInfo(gaps.Count == 0
+                ? $"Camera {number} no pauses > {threshold * 1000:F0} ms"
+                : $"Camera {number} pauses > {threshold * 1000:F0} ms: {string.Join(", ", gaps)}");
+        }
+
         private void ToggleCameraExpansion(int cameraIndex)
         {
+            LogCameraInfo($"Live view clicked: camera {cameraIndex + 1} (expanded camera was {expandedCameraIndex + 1})");
             // Debounce: a single physical click on a TIS camera can generate both
             // WM_PARENTNOTIFY and WM_LBUTTONDOWN, which would fire this method twice
             // and immediately undo the expansion.  Ignore calls within 500 ms of the
@@ -10476,22 +11177,33 @@ namespace QueenPix
 
             private readonly Action _onLeftClick;
 
+            private Control? _control;
+
             public ImagingControlClickHook(Control control, Action onLeftClick)
             {
                 _onLeftClick = onLeftClick;
+                _control = control;
+                // Stay subscribed: the SDK/WinForms can recreate the control's window handle
+                // (e.g. after LiveStart/LiveStop or a layout change). Without re-attaching, the
+                // hook silently stops seeing clicks and the live view no longer expands.
+                control.HandleCreated += OnHandleCreated;
+                control.HandleDestroyed += OnHandleDestroyed;
                 if (control.IsHandleCreated)
                     AssignHandle(control.Handle);
-                else
-                    control.HandleCreated += OnHandleCreated;
             }
 
             private void OnHandleCreated(object? sender, EventArgs e)
             {
                 if (sender is Control c)
                 {
-                    c.HandleCreated -= OnHandleCreated;
+                    if (Handle != IntPtr.Zero) ReleaseHandle();
                     AssignHandle(c.Handle);
                 }
+            }
+
+            private void OnHandleDestroyed(object? sender, EventArgs e)
+            {
+                if (Handle != IntPtr.Zero) ReleaseHandle();
             }
 
             protected override void WndProc(ref Message m)
@@ -10504,7 +11216,16 @@ namespace QueenPix
                 }
             }
 
-            public void Detach() => ReleaseHandle();
+            public void Detach()
+            {
+                if (_control != null)
+                {
+                    _control.HandleCreated -= OnHandleCreated;
+                    _control.HandleDestroyed -= OnHandleDestroyed;
+                    _control = null;
+                }
+                if (Handle != IntPtr.Zero) ReleaseHandle();
+            }
         }
     }
 }

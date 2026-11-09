@@ -285,8 +285,26 @@ namespace QueenPix
 
                 string currentFormat = imagingControl.VideoFormatCurrent?.ToString() ?? "";
                 int idx = cmbFormat.Items.IndexOf(currentFormat);
+
+                // Free sizes: the box is editable, so a size that is not in the list can be typed,
+                // e.g. "Y800 (480x800)". It is checked against the camera when saving.
+                string sizeHelp = "";
+                try { sizeHelp = VideoFormatHelper.Help(imagingControl.VideoFormatDescs); } catch { }
+                cmbFormat.DropDownStyle = ComboBoxStyle.DropDown;
+                new ToolTip { AutoPopDelay = 30000 }.SetToolTip(cmbFormat, sizeHelp);
+                this.Controls.Add(new Label
+                {
+                    Text = "Pick a size or type one, e.g. Y800 (480x800) - hover for the allowed sizes",
+                    Location = new System.Drawing.Point(cmbFormat.Left, cmbFormat.Bottom + 1),
+                    Size = new System.Drawing.Size(cmbFormat.Width, 14),
+                    Font = new System.Drawing.Font("Arial", 7),
+                    ForeColor = System.Drawing.Color.Gray
+                });
+
                 if (idx >= 0)
                     cmbFormat.SelectedIndex = idx;
+                else if (!string.IsNullOrEmpty(currentFormat))
+                    cmbFormat.Text = currentFormat;
             }
             else if (!isImagingSource)
             {
@@ -612,8 +630,10 @@ namespace QueenPix
         {
             SaveAsDefault = true;
 
-            // Save format setting
-            if (cmbFormat.SelectedItem != null)
+            // Save format setting (Imaging Source: the typed text, which may be a free size)
+            if (isImagingSource && !string.IsNullOrWhiteSpace(cmbFormat.Text))
+                settings.Format = cmbFormat.Text.Trim();
+            else if (cmbFormat.SelectedItem != null)
                 settings.Format = cmbFormat.SelectedItem.ToString() ?? "";
 
             if (isImagingSource)
@@ -666,14 +686,33 @@ namespace QueenPix
             Settings = settings;
         }
 
+        // A typed format must be one this camera can do; otherwise explain the allowed sizes and stay open.
+        private bool FormatIsValid()
+        {
+            if (!isImagingSource || imagingControl == null) return true;
+            string name = cmbFormat.Text.Trim();
+            if (string.IsNullOrEmpty(name)) return true;
+            string problem = "";
+            VideoFormat? f = null;
+            try { f = VideoFormatHelper.Find(imagingControl.VideoFormats, imagingControl.VideoFormatDescs, name, out problem); }
+            catch (Exception ex) { problem = ex.Message; }
+            if (f != null) return true;
+            string help = "";
+            try { help = VideoFormatHelper.Help(imagingControl.VideoFormatDescs); } catch { }
+            MessageBox.Show($"{problem}\n\n{help}", "Format not possible", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
+
         private void BtnApply_Click(object? sender, EventArgs e)
         {
+            if (!FormatIsValid()) { this.DialogResult = DialogResult.None; return; }
             ApplyToAllCameras = false;
             SaveSettings();
         }
 
         private void BtnApplyToAll_Click(object? sender, EventArgs e)
         {
+            if (!FormatIsValid()) return;
             ApplyToAllCameras = true;
             SaveSettings();
             this.DialogResult = DialogResult.OK;
